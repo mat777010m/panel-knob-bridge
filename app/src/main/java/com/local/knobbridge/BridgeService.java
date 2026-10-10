@@ -10,7 +10,6 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -18,7 +17,6 @@ import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.util.Base64;
 import android.util.Log;
 
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
@@ -40,8 +38,8 @@ public class BridgeService extends Service {
     private static final String TAG = "KnobBridge";
 
     private String brokerUri = "tcp://192.168.0.7:1883";
-    private String mqttUser = "";
-    private String mqttPass = "";
+    private String mqttUser = "admin";
+    private String mqttPass = "admin";
     private String baseTopic = "panel";
 
     private MqttClient client;
@@ -49,13 +47,30 @@ public class BridgeService extends Service {
     private boolean isCustomScreenActive = false;
     private boolean clockEnabled = true;
 
-    private final Runnable clockRunnable = new Runnable() {
+    // Nasłuchiwanie sprzętowych zmian głośności z fabrycznego modułu wzmacniacza
+    private final BroadcastReceiver hardwareVolumeReceiver = new BroadcastReceiver() {
         @Override
-        public void run() {
+        public void onReceive(Context context, Intent intent) {
+            int room = intent.getIntExtra("room", 1);
+            int volume = intent.getIntExtra("volume", -1);
+            if (volume != -1) {
+                Log.i(TAG, "Hardware volume change detected: Room " + room + " = " + volume);
+                publishVolumeState(room, volume);
+                showNotification("🔊 STREFA " + room, volume + "%", "Głośność", 2500, "#00E5FF", "#FFFFFF");
+            }
+        }
+    };
+
+    // Zegar: aktualizacja co minutę i przy wybudzeniu ekranu
+    private final BroadcastReceiver timeAndScreenReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                wakeDisplayHardware();
+            }
             if (!isCustomScreenActive && clockEnabled) {
                 drawClock();
             }
-            handler.postDelayed(this, 1000);
         }
     };
 
@@ -65,8 +80,20 @@ public class BridgeService extends Service {
         startForegroundNoti();
         wakeDisplayHardware();
         loadConfigAndRegisterReceiver();
+
+        // Odbiorniki zegara i fizycznej głośności
+        IntentFilter timeFilter = new IntentFilter();
+        timeFilter.addAction(Intent.ACTION_TIME_TICK);
+        timeFilter.addAction(Intent.ACTION_SCREEN_ON);
+        registerReceiver(timeAndScreenReceiver, timeFilter);
+
+        IntentFilter volFilter = new IntentFilter();
+        volFilter.addAction("com.naner.volume.changed");
+        volFilter.addAction("com.naner.volume.userchange");
+        registerReceiver(hardwareVolumeReceiver, volFilter);
+
         initMqtt();
-        handler.post(clockRunnable);
+        drawClock();
     }
 
     private void startForegroundNoti() {
@@ -81,13 +108,11 @@ public class BridgeService extends Service {
 
     private void wakeDisplayHardware() {
         try {
-            // Sprawdzona sekwencja wybudzania ekranu i nadania uprawnień
             Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", 
                 "echo on > /proc/vendor/lcd_ctrl && echo 1 > /proc/vendor/led_ctrl && chmod 666 /dev/graphics/fb1"});
             p.waitFor();
-            Log.i(TAG, "Hardware display initialized (echo on > lcd_ctrl)");
         } catch (Exception e) {
-            Log.e(TAG, "Failed to wake display", e);
+            Log.e(TAG, "Display wake failed", e);
         }
     }
 
@@ -97,7 +122,6 @@ public class BridgeService extends Service {
         this.mqttUser = prefs.getString("user", this.mqttUser);
         this.mqttPass = prefs.getString("pass", this.mqttPass);
         this.baseTopic = prefs.getString("topic", this.baseTopic);
-        Log.i(TAG, "Config: broker=" + brokerUri + ", topic=" + baseTopic);
 
         IntentFilter filter = new IntentFilter("com.local.knobbridge.SET_CONFIG");
         registerReceiver(new BroadcastReceiver() {
@@ -109,7 +133,6 @@ public class BridgeService extends Service {
                 if (intent.hasExtra("pass")) ed.putString("pass", intent.getStringExtra("pass"));
                 if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
                 ed.apply();
-                Log.i(TAG, "Config updated via intent, reconnecting MQTT...");
                 loadConfigAndRegisterReceiver();
                 initMqtt();
             }
@@ -126,7 +149,6 @@ public class BridgeService extends Service {
                 MqttConnectOptions opts = new MqttConnectOptions();
                 opts.setCleanSession(true);
                 opts.setAutomaticReconnect(true);
-                opts.setConnectionTimeout(10);
                 if (!mqttUser.isEmpty()) {
                     opts.setUserName(mqttUser);
                     opts.setPassword(mqttPass.toCharArray());
@@ -137,6 +159,7 @@ public class BridgeService extends Service {
                     public void connectComplete(boolean reconnect, String serverURI) {
                         Log.i(TAG, "MQTT Connected to " + serverURI);
                         subscribeTopics();
+                        publishHomeAssistantDiscovery(); // Automatyczna rejestracja w HA
                     }
 
                     @Override
@@ -146,7 +169,9 @@ public class BridgeService extends Service {
 
                     @Override
                     public void messageArrived(String topic, MqttMessage message) {
-                        handleMessage(topic, new String(message.getPayload()).trim());
+                        String payload = new String(message.getPayload()).trim();
+                        Log.i(TAG, "MQTT Received: " + topic + " -> " + payload);
+                        handleMessage(topic, payload);
                     }
 
                     @Override
@@ -155,7 +180,7 @@ public class BridgeService extends Service {
 
                 client.connect(opts);
             } catch (Exception e) {
-                Log.e(TAG, "MQTT init failed: " + e.getMessage());
+                Log.e(TAG, "MQTT connection error: " + e.getMessage());
             }
         }).start();
     }
@@ -164,9 +189,64 @@ public class BridgeService extends Service {
         try {
             client.subscribe(baseTopic + "/volume/set/+");
             client.subscribe(baseTopic + "/display/#");
-            Log.i(TAG, "Subscribed to " + baseTopic + "/#");
+            Log.i(TAG, "Subscribed topics on " + baseTopic);
         } catch (Exception e) {
-            Log.e(TAG, "Subscription error", e);
+            Log.e(TAG, "Subscribe error", e);
+        }
+    }
+
+    // Automatyczna publikacja Auto-Discovery do HA (tworzy urządzenie w kafelku MQTT)
+    private void publishHomeAssistantDiscovery() {
+        try {
+            JSONObject device = new JSONObject();
+            device.put("identifiers", new org.json.JSONArray().put("allwinner_knob_panel"));
+            device.put("name", "Gałka Panel");
+            device.put("model", "Knob Display 240x240");
+            device.put("manufacturer", "Allwinner OEM");
+
+            // Suwak dla Strefy 1 z tematem stanu (synchronizacja!)
+            JSONObject discVol1 = new JSONObject();
+            discVol1.put("name", "Głośność Strefa 1");
+            discVol1.put("unique_id", "knob_panel_zone1_volume");
+            discVol1.put("command_topic", baseTopic + "/volume/set/1");
+            discVol1.put("state_topic", baseTopic + "/volume/state/1");
+            discVol1.put("min", 0);
+            discVol1.put("max", 100);
+            discVol1.put("mode", "slider");
+            discVol1.put("icon", "mdi:volume-high");
+            discVol1.put("device", device);
+
+            // Przełącznik zegarka
+            JSONObject discClock = new JSONObject();
+            discClock.put("name", "Ekran Zegar");
+            discClock.put("unique_id", "knob_panel_clock_toggle");
+            discClock.put("command_topic", baseTopic + "/display/clock");
+            discClock.put("payload_on", "on");
+            discClock.put("payload_off", "off");
+            discClock.put("icon", "mdi:clock-digital");
+            discClock.put("device", device);
+
+            publishRaw("homeassistant/number/knob_panel/vol1/config", discVol1.toString(), true);
+            publishRaw("homeassistant/switch/knob_panel/clock/config", discClock.toString(), true);
+            Log.i(TAG, "Home Assistant MQTT Discovery published successfully");
+        } catch (Exception e) {
+            Log.e(TAG, "Discovery publication error", e);
+        }
+    }
+
+    private void publishVolumeState(int room, int vol) {
+        publishRaw(baseTopic + "/volume/state/" + room, String.valueOf(vol), true);
+    }
+
+    private void publishRaw(String topic, String payload, boolean retained) {
+        try {
+            if (client != null && client.isConnected()) {
+                MqttMessage msg = new MqttMessage(payload.getBytes());
+                msg.setRetained(retained);
+                client.publish(topic, msg);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Publish error to " + topic, e);
         }
     }
 
@@ -180,7 +260,8 @@ public class BridgeService extends Service {
                 intent.putExtra("volume", vol);
                 sendBroadcast(intent);
 
-                showNotification("🔊 STREFA " + room, vol + "%", "Głośność", 3000, "#00E5FF", "#FFFFFF");
+                publishVolumeState(room, vol);
+                showNotification("🔊 STREFA " + room, vol + "%", "Głośność", 2500, "#00E5FF", "#FFFFFF");
                 return;
             }
 
@@ -197,19 +278,6 @@ public class BridgeService extends Service {
                 return;
             }
 
-            if (topic.equals(baseTopic + "/display/image")) {
-                byte[] decoded = Base64.decode(payload, Base64.DEFAULT);
-                Bitmap bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
-                if (bmp != null) {
-                    isCustomScreenActive = true;
-                    Bitmap scaled = Bitmap.createScaledBitmap(bmp, 240, 240, true);
-                    renderToFramebuffer(scaled);
-                    handler.removeCallbacks(resetClockTask);
-                    handler.postDelayed(resetClockTask, 5000);
-                }
-                return;
-            }
-
             if (topic.equals(baseTopic + "/display/clock")) {
                 clockEnabled = !"off".equalsIgnoreCase(payload) && !"false".equalsIgnoreCase(payload);
                 if (!clockEnabled) {
@@ -220,7 +288,7 @@ public class BridgeService extends Service {
                 }
             }
         } catch (Exception e) {
-            Log.e(TAG, "Error handling message", e);
+            Log.e(TAG, "Message handling error", e);
         }
     }
 
@@ -275,18 +343,14 @@ public class BridgeService extends Service {
 
         Date now = new Date();
         paint.setColor(Color.WHITE);
-        paint.setTextSize(64);
+        paint.setTextSize(72);
         paint.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(new SimpleDateFormat("HH:mm", Locale.getDefault()).format(now), 105, 130, paint);
-
-        paint.setColor(Color.parseColor("#FFA726"));
-        paint.setTextSize(26);
-        canvas.drawText(new SimpleDateFormat("ss", Locale.getDefault()).format(now), 195, 130, paint);
+        canvas.drawText(new SimpleDateFormat("HH:mm", Locale.getDefault()).format(now), 120, 125, paint);
 
         paint.setColor(Color.LTGRAY);
-        paint.setTextSize(24);
+        paint.setTextSize(22);
         paint.setTypeface(Typeface.DEFAULT);
-        canvas.drawText(new SimpleDateFormat("EEE, d MMM", new Locale("pl", "PL")).format(now), 120, 180, paint);
+        canvas.drawText(new SimpleDateFormat("EEE, d MMM", new Locale("pl", "PL")).format(now), 120, 165, paint);
 
         renderToFramebuffer(bmp);
     }
@@ -315,7 +379,6 @@ public class BridgeService extends Service {
                 }
             }
 
-            // Zapisujemy bezpośrednio lub przez proces shella, jeśli SELinux rzuca błędem
             File fb = new File("/dev/graphics/fb1");
             if (fb.canWrite()) {
                 FileOutputStream fos = new FileOutputStream(fb);
@@ -340,7 +403,10 @@ public class BridgeService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        handler.removeCallbacks(clockRunnable);
+        try {
+            unregisterReceiver(timeAndScreenReceiver);
+            unregisterReceiver(hardwareVolumeReceiver);
+        } catch (Exception ignored) {}
     }
 
     @Override
