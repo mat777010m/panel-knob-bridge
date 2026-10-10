@@ -22,6 +22,8 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
+import android.net.wifi.WifiManager;
+import android.os.PowerManager;
 
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
 import org.eclipse.paho.client.mqttv3.MqttCallbackExtended;
@@ -43,6 +45,9 @@ import java.util.Locale;
 
 public class BridgeService extends Service {
     private static final String TAG = "KnobBridge";
+
+    private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
 
     private String brokerUri = "tcp://192.168.0.7:1883";
     private String mqttUser = "admin";
@@ -93,17 +98,8 @@ public class BridgeService extends Service {
     public void onCreate() {
         super.onCreate();
         startForegroundNoti();
+        acquireLocks();
         loadConfigAndRegisterReceiver();
-
-        // Utrzymanie procesora na chodzie (bez ekranu)
-        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        PowerManager.WakeLock wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KnobBridge::CpuLock");
-        wakeLock.acquire();
-
-        // Utrzymanie Wi-Fi w trybie High Performance
-        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        WifiManager.WifiLock wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KnobBridge::WifiLock");
-        wifiLock.acquire();
 
         // Pełne zasilenie ekranu na start
         setHardwarePower(true);
@@ -117,6 +113,25 @@ public class BridgeService extends Service {
         startRootInputMonitoring();
         initMqtt();
         drawClock();
+    }
+
+    private void acquireLocks() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KnobBridge::CpuLock");
+                wakeLock.acquire();
+            }
+
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KnobBridge::WifiLock");
+                wifiLock.acquire();
+            }
+            Log.i(TAG, "WakeLock & WifiLock acquired successfully");
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd podczas pobierania blokad zasilania", e);
+        }
     }
 
     private void startForegroundNoti() {
@@ -648,6 +663,11 @@ public class BridgeService extends Service {
         super.onDestroy();
         running = false;
         try { unregisterReceiver(screenStateReceiver); } catch (Exception ignored) {}
+        // Zwalniamy blokady przy zatrzymaniu usługi
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+            if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        } catch (Exception ignored) {}
     }
 
     @Override
