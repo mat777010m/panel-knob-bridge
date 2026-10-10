@@ -16,6 +16,7 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.media.AudioManager;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -50,32 +51,40 @@ public class BridgeService extends Service {
 
     private MqttClient client;
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private boolean isCustomScreenActive = false;
-    private boolean clockEnabled = true;
-    private Thread inputEventThread;
     private boolean running = true;
 
-    // Nasłuchiwanie sprzętowych zmian głośności (z broadcastów systemowych)
-    private final BroadcastReceiver hardwareVolumeReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            int room = intent.getIntExtra("room", 1);
-            int volume = intent.getIntExtra("volume", -1);
-            if (volume != -1) {
-                publishVolumeState(room, volume);
-            }
-        }
-    };
+    // Stany UI
+    private enum ScreenMode { CLOCK, GAUGE, MEDIA, ALERT }
+    private ScreenMode currentMode = ScreenMode.CLOCK;
 
-    // Zegar co minutę i wybudzanie
-    private final BroadcastReceiver timeAndScreenReceiver = new BroadcastReceiver() {
+    // Dane trybu pokrętła (Gauge/Dial)
+    private String gaugeTitle = "Regulacja";
+    private int gaugeValue = 50;
+    private int gaugeMin = 0;
+    private int gaugeMax = 100;
+    private int gaugeStep = 5;
+    private String gaugeUnit = "%";
+    private int gaugeColor = Color.parseColor("#00E5FF");
+
+    private Process inputProcess;
+    private boolean isScreenHardwarePowered = true;
+
+    // Odbiornik stanu ekranu głównego (usypianie sprzętowe matrycy gałki)
+    private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
-                wakeDisplayHardware();
-            }
-            if (!isCustomScreenActive && clockEnabled) {
-                drawClock();
+            String action = intent.getAction();
+            if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                Log.i(TAG, "Główny ekran wygaszony -> Wyłączam sprzętowo ekranik gałki");
+                setHardwarePower(false);
+            } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                Log.i(TAG, "Główny ekran wybudzony -> Włączam sprzętowo ekranik gałki");
+                setHardwarePower(true);
+                redrawCurrentScreen();
+            } else if (Intent.ACTION_TIME_TICK.equals(action)) {
+                if (currentMode == ScreenMode.CLOCK && isScreenHardwarePowered) {
+                    drawClock();
+                }
             }
         }
     };
@@ -84,20 +93,18 @@ public class BridgeService extends Service {
     public void onCreate() {
         super.onCreate();
         startForegroundNoti();
-        wakeDisplayHardware();
         loadConfigAndRegisterReceiver();
 
-        IntentFilter timeFilter = new IntentFilter();
-        timeFilter.addAction(Intent.ACTION_TIME_TICK);
-        timeFilter.addAction(Intent.ACTION_SCREEN_ON);
-        registerReceiver(timeAndScreenReceiver, timeFilter);
+        // Pełne zasilenie ekranu na start
+        setHardwarePower(true);
 
-        IntentFilter volFilter = new IntentFilter();
-        volFilter.addAction("com.naner.volume.changed");
-        volFilter.addAction("com.naner.volume.userchange");
-        registerReceiver(hardwareVolumeReceiver, volFilter);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_TIME_TICK);
+        registerReceiver(screenStateReceiver, filter);
 
-        startInputMonitoring();
+        startRootInputMonitoring();
         initMqtt();
         drawClock();
     }
@@ -106,50 +113,104 @@ public class BridgeService extends Service {
         NotificationChannel chan = new NotificationChannel("knob", "Knob Bridge", NotificationManager.IMPORTANCE_LOW);
         ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(chan);
         Notification noti = new Notification.Builder(this, "knob")
-                .setContentTitle("Knob Bridge Active")
+                .setContentTitle("Knob Engine Active")
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .build();
         startForeground(101, noti);
     }
 
-    private void wakeDisplayHardware() {
+    // Fizyczne zasilanie matrycy i podświetlenia (zero wypalania matrycy)
+    private synchronized void setHardwarePower(boolean enable) {
+        isScreenHardwarePowered = enable;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c",
-                    "echo on > /proc/vendor/lcd_ctrl && echo on > /proc/vendor/led_ctrl && chmod 666 /dev/graphics/fb1"});
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "0"});
+            OutputStream os = p.getOutputStream();
+            if (enable) {
+                os.write("echo on > /proc/vendor/lcd_ctrl\n".getBytes());
+                os.write("echo on > /proc/vendor/led_ctrl\n".getBytes());
+                os.write("echo 0 > /sys/class/graphics/fb1/blank\n".getBytes());
+                os.write("chmod 666 /dev/graphics/fb1\n".getBytes());
+            } else {
+                os.write("echo off > /proc/vendor/lcd_ctrl\n".getBytes());
+                os.write("echo off > /proc/vendor/led_ctrl\n".getBytes());
+                os.write("echo 4 > /sys/class/graphics/fb1/blank\n".getBytes());
+            }
+            os.write("exit\n".getBytes());
+            os.flush();
             p.waitFor();
         } catch (Exception e) {
-            Log.e(TAG, "Display wake failed", e);
+            Log.e(TAG, "Błąd zasilania ekranu", e);
         }
     }
 
-    // Monitorowanie obrotów gałki i kliknięcia z /dev/input/event0
-    private void startInputMonitoring() {
-        inputEventThread = new Thread(() -> {
-            try {
-                Process process = Runtime.getRuntime().exec(new String[]{"sh", "-c", "getevent -l /dev/input/event0"});
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
-                while (running && (line = reader.readLine()) != null) {
-                    // Reagujemy tylko na zdarzenie wciśnięcia (DOWN), ignorując puszczenie (UP)
-                    if (line.contains("DOWN") || line.contains(" 00000001")) {
-                        if (line.contains("KEY_F1")) {
-                            Log.i(TAG, "Knob -> Rotate Left");
-                            publishRaw(baseTopic + "/knob/action", "rotate_left", false);
-                        } else if (line.contains("KEY_F2")) {
-                            Log.i(TAG, "Knob -> Rotate Right");
-                            publishRaw(baseTopic + "/knob/action", "rotate_right", false);
-                        } else if (line.contains("KEY_F3")) {
-                            Log.i(TAG, "Knob -> Click");
-                            publishRaw(baseTopic + "/knob/action", "click", false);
+    // Odczyt enkodera przez proces ROOT (omija ograniczenia SELinux)
+    private void startRootInputMonitoring() {
+        new Thread(() -> {
+            while (running) {
+                try {
+                    inputProcess = Runtime.getRuntime().exec(new String[]{"su", "0"});
+                    OutputStream os = inputProcess.getOutputStream();
+                    os.write("getevent -l /dev/input/event0\n".getBytes());
+                    os.flush();
+
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(inputProcess.getInputStream()));
+                    String line;
+                    while (running && (line = reader.readLine()) != null) {
+                        if (line.contains("DOWN") || line.contains(" 00000001")) {
+                            if (line.contains("KEY_F1")) {
+                                handleKnobTurn(-1);
+                            } else if (line.contains("KEY_F2")) {
+                                handleKnobTurn(1);
+                            } else if (line.contains("KEY_F3")) {
+                                handleKnobClick();
+                            }
                         }
                     }
+                } catch (Exception e) {
+                    Log.e(TAG, "Input stream restart...", e);
+                    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                 }
-            } catch (Exception e) {
-                Log.e(TAG, "Error reading /dev/input/event0", e);
             }
-        });
-        inputEventThread.setDaemon(true);
-        inputEventThread.start();
+        }).start();
+    }
+
+    // Logika obrotu gałką
+    private void handleKnobTurn(int delta) {
+        if (!isScreenHardwarePowered) {
+            // Jeśli ekran wygaszony, pierwszy obrót może go obudzić
+            setHardwarePower(true);
+            redrawCurrentScreen();
+            return;
+        }
+
+        if (currentMode == ScreenMode.GAUGE) {
+            // W trybie pokrętła zmieniamy wartość lokalnie bez żadnego laga!
+            gaugeValue = Math.max(gaugeMin, Math.min(gaugeMax, gaugeValue + (delta * gaugeStep)));
+            drawGaugeScreen();
+            publishRaw(baseTopic + "/knob/gauge_value", String.valueOf(gaugeValue), false);
+            publishRaw(baseTopic + "/knob/action", delta > 0 ? "rotate_right" : "rotate_left", false);
+            resetAutoClockTimeout(5000);
+        } else {
+            // Tryb spoczynku: przesyłamy akcję do HA (np. do głośności muzyki)
+            publishRaw(baseTopic + "/knob/action", delta > 0 ? "rotate_right" : "rotate_left", false);
+        }
+    }
+
+    // Logika kliknięcia
+    private void handleKnobClick() {
+        if (!isScreenHardwarePowered) {
+            setHardwarePower(true);
+            redrawCurrentScreen();
+            return;
+        }
+
+        if (currentMode == ScreenMode.GAUGE) {
+            // Zatwierdzenie wartości z pokrętła w HA i powrót do zegarka
+            publishRaw(baseTopic + "/knob/confirm", String.valueOf(gaugeValue), false);
+            returnToClock();
+        } else {
+            publishRaw(baseTopic + "/knob/action", "click", false);
+        }
     }
 
     private void loadConfigAndRegisterReceiver() {
@@ -205,7 +266,7 @@ public class BridgeService extends Service {
 
                     @Override
                     public void messageArrived(String topic, MqttMessage message) {
-                        handleMessage(topic, new String(message.getPayload()).trim());
+                        handleIncomingMqtt(topic, new String(message.getPayload()).trim());
                     }
 
                     @Override
@@ -214,280 +275,176 @@ public class BridgeService extends Service {
 
                 client.connect(opts);
             } catch (Exception e) {
-                Log.e(TAG, "MQTT connection error: " + e.getMessage());
+                Log.e(TAG, "MQTT Error: " + e.getMessage());
             }
         }).start();
     }
 
     private void subscribeTopics() {
         try {
-            client.subscribe(baseTopic + "/volume/set/+");
             client.subscribe(baseTopic + "/display/#");
-            Log.i(TAG, "Subscribed topics on " + baseTopic);
-        } catch (Exception e) {
-            Log.e(TAG, "Subscribe error", e);
-        }
+            client.subscribe(baseTopic + "/volume/#");
+        } catch (Exception e) {}
     }
 
-    // Wszystkie encje w DOKŁADNIE JEDNYM urządzeniu "Gałka Panel"
+    // Auto-Discovery: jedno spójne urządzenie w Home Assistancie
     private void publishHomeAssistantDiscovery() {
         try {
             JSONObject device = new JSONObject();
-            device.put("identifiers", new JSONArray().put("panel_knob_unified"));
+            device.put("identifiers", new JSONArray().put("panel_knob_engine"));
             device.put("name", "Gałka Panel");
-            device.put("model", "Allwinner Knob 240x240");
+            device.put("model", "Allwinner Knob 240x240 Engine");
             device.put("manufacturer", "Custom Smart Home");
 
-            // 1. Głośność Strefa 1
-            JSONObject v1 = new JSONObject();
-            v1.put("name", "Głośność Strefa 1");
-            v1.put("unique_id", "knob_unified_vol1");
-            v1.put("command_topic", baseTopic + "/volume/set/1");
-            v1.put("state_topic", baseTopic + "/volume/state/1");
-            v1.put("min", 0);
-            v1.put("max", 100);
-            v1.put("mode", "slider");
-            v1.put("icon", "mdi:volume-high");
-            v1.put("device", device);
-            publishRaw("homeassistant/number/panel_knob/vol1/config", v1.toString(), true);
-
-            // 2. Głośność Strefa 2
-            JSONObject v2 = new JSONObject();
-            v2.put("name", "Głośność Strefa 2");
-            v2.put("unique_id", "knob_unified_vol2");
-            v2.put("command_topic", baseTopic + "/volume/set/2");
-            v2.put("state_topic", baseTopic + "/volume/state/2");
-            v2.put("min", 0);
-            v2.put("max", 100);
-            v2.put("mode", "slider");
-            v2.put("icon", "mdi:volume-high");
-            v2.put("device", device);
-            publishRaw("homeassistant/number/panel_knob/vol2/config", v2.toString(), true);
-
-            // 3. Przełącznik Zegara
-            JSONObject clk = new JSONObject();
-            clk.put("name", "Ekran Zegar");
-            clk.put("unique_id", "knob_unified_clock");
-            clk.put("command_topic", baseTopic + "/display/clock");
-            clk.put("payload_on", "on");
-            clk.put("payload_off", "off");
-            clk.put("icon", "mdi:clock-digital");
-            clk.put("device", device);
-            publishRaw("homeassistant/switch/panel_knob/clock/config", clk.toString(), true);
-
-            // 4. Pole Tekstowe (wpisujesz tekst w HA -> wyświetla na gałce)
-            JSONObject txt = new JSONObject();
-            txt.put("name", "Ekran Tekst");
-            txt.put("unique_id", "knob_unified_text");
-            txt.put("command_topic", baseTopic + "/display/text");
-            txt.put("icon", "mdi:text-box-outline");
-            txt.put("device", device);
-            publishRaw("homeassistant/text/panel_knob/text/config", txt.toString(), true);
-
-            // 5. Suwak Progresu / Rolety (z okrągłym łukiem na gałce)
-            JSONObject prog = new JSONObject();
-            prog.put("name", "Ekran Progres / Roleta");
-            prog.put("unique_id", "knob_unified_progress");
-            prog.put("command_topic", baseTopic + "/display/progress");
-            prog.put("state_topic", baseTopic + "/display/progress_state");
-            prog.put("min", 0);
-            prog.put("max", 100);
-            prog.put("mode", "slider");
-            prog.put("icon", "mdi:circle-slice-5");
-            prog.put("device", device);
-            publishRaw("homeassistant/number/panel_knob/progress/config", prog.toString(), true);
-
-            // 6. Sensor Akcji Gałki (rotate_left, rotate_right, click)
+            // Sensor akcji gałki (rotate_left, rotate_right, click)
             JSONObject act = new JSONObject();
             act.put("name", "Akcja Gałki");
-            act.put("unique_id", "knob_unified_action");
+            act.put("unique_id", "knob_engine_action");
             act.put("state_topic", baseTopic + "/knob/action");
             act.put("icon", "mdi:rotate-right");
             act.put("device", device);
             publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
 
-            Log.i(TAG, "All unified entities published to HA");
+            // Sensor wartości pokrętła
+            JSONObject gVal = new JSONObject();
+            gVal.put("name", "Wartość Pokrętła");
+            gVal.put("unique_id", "knob_engine_gauge_val");
+            gVal.put("state_topic", baseTopic + "/knob/gauge_value");
+            gVal.put("icon", "mdi:gauge");
+            gVal.put("device", device);
+            publishRaw("homeassistant/sensor/panel_knob/gauge_val/config", gVal.toString(), true);
+
+            // Włącznik zasilania ekranika
+            JSONObject pwr = new JSONObject();
+            pwr.put("name", "Zasilanie Ekranu");
+            pwr.put("unique_id", "knob_engine_power");
+            pwr.put("command_topic", baseTopic + "/display/power");
+            pwr.put("payload_on", "on");
+            pwr.put("payload_off", "off");
+            pwr.put("icon", "mdi:power");
+            pwr.put("device", device);
+            publishRaw("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
+
+            // Proste pole tekstowe do wysyłania alertu
+            JSONObject txt = new JSONObject();
+            txt.put("name", "Wyślij Wiadomość");
+            txt.put("unique_id", "knob_engine_send_text");
+            txt.put("command_topic", baseTopic + "/display/text");
+            txt.put("icon", "mdi:message-text-outline");
+            txt.put("device", device);
+            publishRaw("homeassistant/text/panel_knob/send_text/config", txt.toString(), true);
+
         } catch (Exception e) {
-            Log.e(TAG, "Discovery publication error", e);
+            Log.e(TAG, "Discovery error", e);
         }
     }
 
-    private void publishVolumeState(int room, int vol) {
-        publishRaw(baseTopic + "/volume/state/" + room, String.valueOf(vol), true);
-    }
-
-    private void publishRaw(String topic, String payload, boolean retained) {
+    private void handleIncomingMqtt(String topic, String payload) {
         try {
-            if (client != null && client.isConnected()) {
-                MqttMessage msg = new MqttMessage(payload.getBytes());
-                msg.setRetained(retained);
-                client.publish(topic, msg);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Publish error: " + topic, e);
-        }
-    }
-
-    private void handleMessage(String topic, String payload) {
-        try {
-            // Zmiana głośności stref
-            if (topic.startsWith(baseTopic + "/volume/set/")) {
-                int room = Integer.parseInt(topic.substring((baseTopic + "/volume/set/").length()));
-                int vol = Integer.parseInt(payload);
-                Intent intent = new Intent("com.naner.volume.userchange");
-                intent.putExtra("room", room);
-                intent.putExtra("volume", vol);
-                sendBroadcast(intent);
-
-                publishVolumeState(room, vol);
-                showNotification("🔊 STREFA " + room, vol + "%", "Głośność", 2500, "#00E5FF", "#FFFFFF");
+            // 1. Ręczne wygaszanie/budzenie zasilania
+            if (topic.equals(baseTopic + "/display/power")) {
+                setHardwarePower("on".equalsIgnoreCase(payload));
+                if (isScreenHardwarePowered) redrawCurrentScreen();
                 return;
             }
 
-            // Wyświetlenie prostego tekstu z encji HA
-            if (topic.equals(baseTopic + "/display/text")) {
-                showNotification("WIADOMOŚĆ", payload, "", 4000, "#FFA726", "#FFFFFF");
-                return;
-            }
-
-            // Wyświetlenie okrągłego łuku progresu (roleta, bateria, itp.)
-            if (topic.equals(baseTopic + "/display/progress")) {
-                int val = Integer.parseInt(payload);
-                publishRaw(baseTopic + "/display/progress_state", String.valueOf(val), true);
-                drawProgressArc(val, "ROLETA");
-                return;
-            }
-
-            // Własny JSON z kolorami
-            if (topic.equals(baseTopic + "/display/custom")) {
+            // 2. Tryb GAUGE (Pokrętło z HA: roleta, światło, temp)
+            if (topic.equals(baseTopic + "/display/gauge")) {
                 JSONObject json = new JSONObject(payload);
-                showNotification(
-                        json.optString("title", ""),
-                        json.optString("text", ""),
-                        json.optString("sub", ""),
-                        json.optInt("duration", 4000),
-                        json.optString("title_color", "#4FC3F7"),
-                        json.optString("text_color", "#FFFFFF")
-                );
+                gaugeTitle = json.optString("title", "Regulacja");
+                gaugeValue = json.optInt("value", 50);
+                gaugeMin = json.optInt("min", 0);
+                gaugeMax = json.optInt("max", 100);
+                gaugeStep = json.optInt("step", 5);
+                gaugeUnit = json.optString("unit", "%");
+                gaugeColor = Color.parseColor(json.optString("color", "#00E5FF"));
+
+                currentMode = ScreenMode.GAUGE;
+                drawGaugeScreen();
+                resetAutoClockTimeout(json.optInt("timeout", 6000));
                 return;
             }
 
-            // Surowy obraz Base64
-            if (topic.equals(baseTopic + "/display/image")) {
-                byte[] decoded = Base64.decode(payload, Base64.DEFAULT);
-                Bitmap bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
-                if (bmp != null) {
-                    isCustomScreenActive = true;
-                    Bitmap scaled = Bitmap.createScaledBitmap(bmp, 240, 240, true);
-                    renderToFramebuffer(scaled);
-                    handler.removeCallbacks(resetClockTask);
-                    handler.postDelayed(resetClockTask, 5000);
+            // 3. Tryb MEDIA (Radio / Odtwarzacz)
+            if (topic.equals(baseTopic + "/display/media")) {
+                JSONObject json = new JSONObject(payload);
+                String title = json.optString("title", "Odtwarzacz");
+                String subtitle = json.optString("subtitle", "");
+                String base64Img = json.optString("image_base64", "");
+
+                currentMode = ScreenMode.MEDIA;
+                drawMediaScreen(title, subtitle, base64Img);
+                resetAutoClockTimeout(json.optInt("timeout", 10000));
+                return;
+            }
+
+            // 4. Tryb ALERT (Dzwonek, powiadomienie)
+            if (topic.equals(baseTopic + "/display/alert") || topic.equals(baseTopic + "/display/text")) {
+                String title = "POWIADOMIENIE";
+                String msg = payload;
+                String color = "#FF5722";
+                int duration = 5000;
+
+                if (payload.startsWith("{")) {
+                    JSONObject json = new JSONObject(payload);
+                    title = json.optString("title", title);
+                    msg = json.optString("text", "");
+                    color = json.optString("color", color);
+                    duration = json.optInt("duration", duration);
                 }
+
+                currentMode = ScreenMode.ALERT;
+                drawAlertScreen(title, msg, color);
+                resetAutoClockTimeout(duration);
                 return;
             }
 
-            // Włącznik zegara
+            // 5. Powrót do zegara
             if (topic.equals(baseTopic + "/display/clock")) {
-                clockEnabled = !"off".equalsIgnoreCase(payload) && !"false".equalsIgnoreCase(payload);
-                if (!clockEnabled) {
-                    clearScreen();
-                } else {
-                    isCustomScreenActive = false;
-                    drawClock();
-                }
+                returnToClock();
+                return;
+            }
+
+            // 6. Głośność multimediów Androida (gdybyś chciał regulować tablet z HA)
+            if (topic.equals(baseTopic + "/volume/media/set")) {
+                int volPercent = Integer.parseInt(payload);
+                AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+                int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                int target = (max * volPercent) / 100;
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
             }
         } catch (Exception e) {
-            Log.e(TAG, "Message handling error", e);
+            Log.e(TAG, "Błąd obsługi MQTT", e);
         }
     }
 
-    // Nowoczesny okrągły łuk 240x240 z procentem na środku
-    private synchronized void drawProgressArc(int percent, String label) {
-        isCustomScreenActive = true;
-        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
-        Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
-
-        // Szare tło łuku
-        Paint arcBg = new Paint();
-        arcBg.setAntiAlias(true);
-        arcBg.setStyle(Paint.Style.STROKE);
-        arcBg.setStrokeWidth(16);
-        arcBg.setColor(Color.DKGRAY);
-        RectF rect = new RectF(28, 28, 212, 212);
-        canvas.drawArc(rect, 135, 270, false, arcBg);
-
-        // Aktywny łuk (morski błękit)
-        Paint arcFg = new Paint();
-        arcFg.setAntiAlias(true);
-        arcFg.setStyle(Paint.Style.STROKE);
-        arcFg.setStrokeWidth(16);
-        arcFg.setStrokeCap(Paint.Cap.ROUND);
-        arcFg.setColor(Color.parseColor("#00E5FF"));
-        float sweep = (270f * Math.max(0, Math.min(100, percent))) / 100f;
-        canvas.drawArc(rect, 135, sweep, false, arcFg);
-
-        // Wartość procentowa na środku
-        Paint textPaint = new Paint();
-        textPaint.setAntiAlias(true);
-        textPaint.setTextAlign(Paint.Align.CENTER);
-        textPaint.setColor(Color.WHITE);
-        textPaint.setTextSize(54);
-        textPaint.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(percent + "%", 120, 132, textPaint);
-
-        // Etykieta pod spodem
-        Paint labelPaint = new Paint();
-        labelPaint.setAntiAlias(true);
-        labelPaint.setTextAlign(Paint.Align.CENTER);
-        labelPaint.setColor(Color.LTGRAY);
-        labelPaint.setTextSize(22);
-        canvas.drawText(label, 120, 175, labelPaint);
-
-        renderToFramebuffer(bmp);
-        handler.removeCallbacks(resetClockTask);
-        handler.postDelayed(resetClockTask, 3500);
-    }
-
-    private synchronized void showNotification(String title, String mainText, String sub, int durationMs, String titleColorHex, String textColorHex) {
-        isCustomScreenActive = true;
-        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
-        Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
-
-        Paint paint = new Paint();
-        paint.setAntiAlias(true);
-        paint.setTextAlign(Paint.Align.CENTER);
-
-        paint.setColor(Color.parseColor(titleColorHex));
-        paint.setTextSize(26);
-        paint.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(title, 120, 55, paint);
-
-        paint.setColor(Color.parseColor(textColorHex));
-        paint.setTextSize(mainText.length() > 6 ? 32 : 54);
-        canvas.drawText(mainText, 120, 135, paint);
-
-        if (!sub.isEmpty()) {
-            paint.setColor(Color.GRAY);
-            paint.setTextSize(22);
-            canvas.drawText(sub, 120, 195, paint);
-        }
-
-        renderToFramebuffer(bmp);
-        handler.removeCallbacks(resetClockTask);
-        if (durationMs > 0) {
-            handler.postDelayed(resetClockTask, durationMs);
+    private void redrawCurrentScreen() {
+        if (!isScreenHardwarePowered) return;
+        switch (currentMode) {
+            case CLOCK: drawClock(); break;
+            case GAUGE: drawGaugeScreen(); break;
+            default: drawClock(); break;
         }
     }
 
-    private final Runnable resetClockTask = () -> {
-        isCustomScreenActive = false;
-        if (clockEnabled) {
+    private final Runnable autoClockTask = this::returnToClock;
+
+    private void resetAutoClockTimeout(int ms) {
+        handler.removeCallbacks(autoClockTask);
+        if (ms > 0) {
+            handler.postDelayed(autoClockTask, ms);
+        }
+    }
+
+    private void returnToClock() {
+        currentMode = ScreenMode.CLOCK;
+        handler.removeCallbacks(autoClockTask);
+        if (isScreenHardwarePowered) {
             drawClock();
         }
-    };
+    }
 
+    // EKRAN 1: Zegar
     private synchronized void drawClock() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -499,7 +456,7 @@ public class BridgeService extends Service {
 
         Date now = new Date();
         paint.setColor(Color.WHITE);
-        paint.setTextSize(72);
+        paint.setTextSize(70);
         paint.setTypeface(Typeface.DEFAULT_BOLD);
         canvas.drawText(new SimpleDateFormat("HH:mm", Locale.getDefault()).format(now), 120, 125, paint);
 
@@ -511,14 +468,134 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
-    private synchronized void clearScreen() {
+    // EKRAN 2: Pokrętło (Gauge) z łukiem i procentem
+    private synchronized void drawGaugeScreen() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
         canvas.drawColor(Color.BLACK);
+
+        RectF arcRect = new RectF(28, 28, 212, 212);
+
+        // Tło łuku
+        Paint bgPaint = new Paint();
+        bgPaint.setAntiAlias(true);
+        bgPaint.setStyle(Paint.Style.STROKE);
+        bgPaint.setStrokeWidth(16);
+        bgPaint.setColor(Color.DKGRAY);
+        canvas.drawArc(arcRect, 135, 270, false, bgPaint);
+
+        // Aktywny łuk
+        Paint fgPaint = new Paint();
+        fgPaint.setAntiAlias(true);
+        fgPaint.setStyle(Paint.Style.STROKE);
+        fgPaint.setStrokeWidth(16);
+        fgPaint.setStrokeCap(Paint.Cap.ROUND);
+        fgPaint.setColor(gaugeColor);
+
+        float range = Math.max(1, gaugeMax - gaugeMin);
+        float pct = ((float)(gaugeValue - gaugeMin)) / range;
+        float sweep = 270f * Math.max(0f, Math.min(1f, pct));
+        canvas.drawArc(arcRect, 135, sweep, false, fgPaint);
+
+        // Tytuł na górze
+        Paint textPaint = new Paint();
+        textPaint.setAntiAlias(true);
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        textPaint.setColor(Color.LTGRAY);
+        textPaint.setTextSize(22);
+        canvas.drawText(gaugeTitle, 120, 75, textPaint);
+
+        // Wartość na środku
+        textPaint.setColor(Color.WHITE);
+        textPaint.setTextSize(54);
+        textPaint.setTypeface(Typeface.DEFAULT_BOLD);
+        canvas.drawText(gaugeValue + gaugeUnit, 120, 135, textPaint);
+
+        // Podpowiedź zatwierdzenia
+        textPaint.setColor(Color.GRAY);
+        textPaint.setTextSize(18);
+        textPaint.setTypeface(Typeface.DEFAULT);
+        canvas.drawText("Kliknij = OK", 120, 185, textPaint);
+
         renderToFramebuffer(bmp);
     }
 
+    // EKRAN 3: Media / Radio
+    private synchronized void drawMediaScreen(String title, String subtitle, String base64Img) {
+        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
+        Canvas canvas = new Canvas(bmp);
+        canvas.drawColor(Color.BLACK);
+
+        if (!base64Img.isEmpty()) {
+            try {
+                byte[] raw = Base64.decode(base64Img, Base64.DEFAULT);
+                Bitmap art = BitmapFactory.decodeByteArray(raw, 0, raw.length);
+                if (art != null) {
+                    Bitmap scaled = Bitmap.createScaledBitmap(art, 240, 240, true);
+                    canvas.drawBitmap(scaled, 0, 0, null);
+                    renderToFramebuffer(bmp);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        Paint paint = new Paint();
+        paint.setAntiAlias(true);
+        paint.setTextAlign(Paint.Align.CENTER);
+
+        paint.setColor(Color.parseColor("#FFA726"));
+        paint.setTextSize(24);
+        paint.setTypeface(Typeface.DEFAULT_BOLD);
+        canvas.drawText("📻 RADIO / AUDIO", 120, 60, paint);
+
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(title.length() > 10 ? 28 : 36);
+        canvas.drawText(title, 120, 125, paint);
+
+        if (!subtitle.isEmpty()) {
+            paint.setColor(Color.LTGRAY);
+            paint.setTextSize(20);
+            canvas.drawText(subtitle, 120, 175, paint);
+        }
+
+        renderToFramebuffer(bmp);
+    }
+
+    // EKRAN 4: Alert
+    private synchronized void drawAlertScreen(String title, String msg, String colorHex) {
+        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
+        Canvas canvas = new Canvas(bmp);
+        canvas.drawColor(Color.BLACK);
+
+        Paint paint = new Paint();
+        paint.setAntiAlias(true);
+        paint.setTextAlign(Paint.Align.CENTER);
+
+        paint.setColor(Color.parseColor(colorHex));
+        paint.setTextSize(28);
+        paint.setTypeface(Typeface.DEFAULT_BOLD);
+        canvas.drawText(title, 120, 65, paint);
+
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(msg.length() > 8 ? 30 : 48);
+        canvas.drawText(msg, 120, 140, paint);
+
+        renderToFramebuffer(bmp);
+    }
+
+    private void publishRaw(String topic, String payload, boolean retained) {
+        try {
+            if (client != null && client.isConnected()) {
+                MqttMessage msg = new MqttMessage(payload.getBytes());
+                msg.setRetained(retained);
+                client.publish(topic, msg);
+            }
+        } catch (Exception e) {}
+    }
+
+    // Bezpośredni zapis do fb1 z lustrzanym odbiciem
     private synchronized void renderToFramebuffer(Bitmap bmp) {
+        if (!isScreenHardwarePowered) return;
         try {
             byte[] raw = new byte[240 * 240 * 2];
             int idx = 0;
@@ -542,7 +619,7 @@ public class BridgeService extends Service {
                 fos.flush();
                 fos.close();
             } else {
-                Process process = Runtime.getRuntime().exec("sh");
+                Process process = Runtime.getRuntime().exec(new String[]{"su", "0"});
                 OutputStream os = process.getOutputStream();
                 os.write(("cat > /dev/graphics/fb1\n").getBytes());
                 os.flush();
@@ -552,7 +629,7 @@ public class BridgeService extends Service {
                 process.waitFor();
             }
         } catch (Exception e) {
-            Log.e(TAG, "Framebuffer write error", e);
+            Log.e(TAG, "Framebuffer error", e);
         }
     }
 
@@ -560,14 +637,9 @@ public class BridgeService extends Service {
     public void onDestroy() {
         super.onDestroy();
         running = false;
-        try {
-            unregisterReceiver(timeAndScreenReceiver);
-            unregisterReceiver(hardwareVolumeReceiver);
-        } catch (Exception ignored) {}
+        try { unregisterReceiver(screenStateReceiver); } catch (Exception ignored) {}
     }
 
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    public IBinder onBind(Intent intent) { return null; }
 }
