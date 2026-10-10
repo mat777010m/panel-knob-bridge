@@ -10,13 +10,16 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.Base64;
 import android.util.Log;
 
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
@@ -25,10 +28,13 @@ import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -46,22 +52,22 @@ public class BridgeService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean isCustomScreenActive = false;
     private boolean clockEnabled = true;
+    private Thread inputEventThread;
+    private boolean running = true;
 
-    // Nasłuchiwanie sprzętowych zmian głośności z fabrycznego modułu wzmacniacza
+    // Nasłuchiwanie sprzętowych zmian głośności (z broadcastów systemowych)
     private final BroadcastReceiver hardwareVolumeReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             int room = intent.getIntExtra("room", 1);
             int volume = intent.getIntExtra("volume", -1);
             if (volume != -1) {
-                Log.i(TAG, "Hardware volume change detected: Room " + room + " = " + volume);
                 publishVolumeState(room, volume);
-                showNotification("🔊 STREFA " + room, volume + "%", "Głośność", 2500, "#00E5FF", "#FFFFFF");
             }
         }
     };
 
-    // Zegar: aktualizacja co minutę i przy wybudzeniu ekranu
+    // Zegar co minutę i wybudzanie
     private final BroadcastReceiver timeAndScreenReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -81,7 +87,6 @@ public class BridgeService extends Service {
         wakeDisplayHardware();
         loadConfigAndRegisterReceiver();
 
-        // Odbiorniki zegara i fizycznej głośności
         IntentFilter timeFilter = new IntentFilter();
         timeFilter.addAction(Intent.ACTION_TIME_TICK);
         timeFilter.addAction(Intent.ACTION_SCREEN_ON);
@@ -92,6 +97,7 @@ public class BridgeService extends Service {
         volFilter.addAction("com.naner.volume.userchange");
         registerReceiver(hardwareVolumeReceiver, volFilter);
 
+        startInputMonitoring();
         initMqtt();
         drawClock();
     }
@@ -108,12 +114,42 @@ public class BridgeService extends Service {
 
     private void wakeDisplayHardware() {
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", 
-                "echo on > /proc/vendor/lcd_ctrl && echo 1 > /proc/vendor/led_ctrl && chmod 666 /dev/graphics/fb1"});
+            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c",
+                    "echo on > /proc/vendor/lcd_ctrl && echo on > /proc/vendor/led_ctrl && chmod 666 /dev/graphics/fb1"});
             p.waitFor();
         } catch (Exception e) {
             Log.e(TAG, "Display wake failed", e);
         }
+    }
+
+    // Monitorowanie obrotów gałki i kliknięcia z /dev/input/event0
+    private void startInputMonitoring() {
+        inputEventThread = new Thread(() -> {
+            try {
+                Process process = Runtime.getRuntime().exec(new String[]{"sh", "-c", "getevent -l /dev/input/event0"});
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                String line;
+                while (running && (line = reader.readLine()) != null) {
+                    // Reagujemy tylko na zdarzenie wciśnięcia (DOWN), ignorując puszczenie (UP)
+                    if (line.contains("DOWN") || line.contains(" 00000001")) {
+                        if (line.contains("KEY_F1")) {
+                            Log.i(TAG, "Knob -> Rotate Left");
+                            publishRaw(baseTopic + "/knob/action", "rotate_left", false);
+                        } else if (line.contains("KEY_F2")) {
+                            Log.i(TAG, "Knob -> Rotate Right");
+                            publishRaw(baseTopic + "/knob/action", "rotate_right", false);
+                        } else if (line.contains("KEY_F3")) {
+                            Log.i(TAG, "Knob -> Click");
+                            publishRaw(baseTopic + "/knob/action", "click", false);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error reading /dev/input/event0", e);
+            }
+        });
+        inputEventThread.setDaemon(true);
+        inputEventThread.start();
     }
 
     private void loadConfigAndRegisterReceiver() {
@@ -159,7 +195,7 @@ public class BridgeService extends Service {
                     public void connectComplete(boolean reconnect, String serverURI) {
                         Log.i(TAG, "MQTT Connected to " + serverURI);
                         subscribeTopics();
-                        publishHomeAssistantDiscovery(); // Automatyczna rejestracja w HA
+                        publishHomeAssistantDiscovery();
                     }
 
                     @Override
@@ -169,9 +205,7 @@ public class BridgeService extends Service {
 
                     @Override
                     public void messageArrived(String topic, MqttMessage message) {
-                        String payload = new String(message.getPayload()).trim();
-                        Log.i(TAG, "MQTT Received: " + topic + " -> " + payload);
-                        handleMessage(topic, payload);
+                        handleMessage(topic, new String(message.getPayload()).trim());
                     }
 
                     @Override
@@ -195,40 +229,84 @@ public class BridgeService extends Service {
         }
     }
 
-    // Automatyczna publikacja Auto-Discovery do HA (tworzy urządzenie w kafelku MQTT)
+    // Wszystkie encje w DOKŁADNIE JEDNYM urządzeniu "Gałka Panel"
     private void publishHomeAssistantDiscovery() {
         try {
             JSONObject device = new JSONObject();
-            device.put("identifiers", new org.json.JSONArray().put("allwinner_knob_panel"));
+            device.put("identifiers", new JSONArray().put("panel_knob_unified"));
             device.put("name", "Gałka Panel");
-            device.put("model", "Knob Display 240x240");
-            device.put("manufacturer", "Allwinner OEM");
+            device.put("model", "Allwinner Knob 240x240");
+            device.put("manufacturer", "Custom Smart Home");
 
-            // Suwak dla Strefy 1 z tematem stanu (synchronizacja!)
-            JSONObject discVol1 = new JSONObject();
-            discVol1.put("name", "Głośność Strefa 1");
-            discVol1.put("unique_id", "knob_panel_zone1_volume");
-            discVol1.put("command_topic", baseTopic + "/volume/set/1");
-            discVol1.put("state_topic", baseTopic + "/volume/state/1");
-            discVol1.put("min", 0);
-            discVol1.put("max", 100);
-            discVol1.put("mode", "slider");
-            discVol1.put("icon", "mdi:volume-high");
-            discVol1.put("device", device);
+            // 1. Głośność Strefa 1
+            JSONObject v1 = new JSONObject();
+            v1.put("name", "Głośność Strefa 1");
+            v1.put("unique_id", "knob_unified_vol1");
+            v1.put("command_topic", baseTopic + "/volume/set/1");
+            v1.put("state_topic", baseTopic + "/volume/state/1");
+            v1.put("min", 0);
+            v1.put("max", 100);
+            v1.put("mode", "slider");
+            v1.put("icon", "mdi:volume-high");
+            v1.put("device", device);
+            publishRaw("homeassistant/number/panel_knob/vol1/config", v1.toString(), true);
 
-            // Przełącznik zegarka
-            JSONObject discClock = new JSONObject();
-            discClock.put("name", "Ekran Zegar");
-            discClock.put("unique_id", "knob_panel_clock_toggle");
-            discClock.put("command_topic", baseTopic + "/display/clock");
-            discClock.put("payload_on", "on");
-            discClock.put("payload_off", "off");
-            discClock.put("icon", "mdi:clock-digital");
-            discClock.put("device", device);
+            // 2. Głośność Strefa 2
+            JSONObject v2 = new JSONObject();
+            v2.put("name", "Głośność Strefa 2");
+            v2.put("unique_id", "knob_unified_vol2");
+            v2.put("command_topic", baseTopic + "/volume/set/2");
+            v2.put("state_topic", baseTopic + "/volume/state/2");
+            v2.put("min", 0);
+            v2.put("max", 100);
+            v2.put("mode", "slider");
+            v2.put("icon", "mdi:volume-high");
+            v2.put("device", device);
+            publishRaw("homeassistant/number/panel_knob/vol2/config", v2.toString(), true);
 
-            publishRaw("homeassistant/number/knob_panel/vol1/config", discVol1.toString(), true);
-            publishRaw("homeassistant/switch/knob_panel/clock/config", discClock.toString(), true);
-            Log.i(TAG, "Home Assistant MQTT Discovery published successfully");
+            // 3. Przełącznik Zegara
+            JSONObject clk = new JSONObject();
+            clk.put("name", "Ekran Zegar");
+            clk.put("unique_id", "knob_unified_clock");
+            clk.put("command_topic", baseTopic + "/display/clock");
+            clk.put("payload_on", "on");
+            clk.put("payload_off", "off");
+            clk.put("icon", "mdi:clock-digital");
+            clk.put("device", device);
+            publishRaw("homeassistant/switch/panel_knob/clock/config", clk.toString(), true);
+
+            // 4. Pole Tekstowe (wpisujesz tekst w HA -> wyświetla na gałce)
+            JSONObject txt = new JSONObject();
+            txt.put("name", "Ekran Tekst");
+            txt.put("unique_id", "knob_unified_text");
+            txt.put("command_topic", baseTopic + "/display/text");
+            txt.put("icon", "mdi:text-box-outline");
+            txt.put("device", device);
+            publishRaw("homeassistant/text/panel_knob/text/config", txt.toString(), true);
+
+            // 5. Suwak Progresu / Rolety (z okrągłym łukiem na gałce)
+            JSONObject prog = new JSONObject();
+            prog.put("name", "Ekran Progres / Roleta");
+            prog.put("unique_id", "knob_unified_progress");
+            prog.put("command_topic", baseTopic + "/display/progress");
+            prog.put("state_topic", baseTopic + "/display/progress_state");
+            prog.put("min", 0);
+            prog.put("max", 100);
+            prog.put("mode", "slider");
+            prog.put("icon", "mdi:circle-slice-5");
+            prog.put("device", device);
+            publishRaw("homeassistant/number/panel_knob/progress/config", prog.toString(), true);
+
+            // 6. Sensor Akcji Gałki (rotate_left, rotate_right, click)
+            JSONObject act = new JSONObject();
+            act.put("name", "Akcja Gałki");
+            act.put("unique_id", "knob_unified_action");
+            act.put("state_topic", baseTopic + "/knob/action");
+            act.put("icon", "mdi:rotate-right");
+            act.put("device", device);
+            publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
+
+            Log.i(TAG, "All unified entities published to HA");
         } catch (Exception e) {
             Log.e(TAG, "Discovery publication error", e);
         }
@@ -246,12 +324,13 @@ public class BridgeService extends Service {
                 client.publish(topic, msg);
             }
         } catch (Exception e) {
-            Log.e(TAG, "Publish error to " + topic, e);
+            Log.e(TAG, "Publish error: " + topic, e);
         }
     }
 
     private void handleMessage(String topic, String payload) {
         try {
+            // Zmiana głośności stref
             if (topic.startsWith(baseTopic + "/volume/set/")) {
                 int room = Integer.parseInt(topic.substring((baseTopic + "/volume/set/").length()));
                 int vol = Integer.parseInt(payload);
@@ -265,6 +344,21 @@ public class BridgeService extends Service {
                 return;
             }
 
+            // Wyświetlenie prostego tekstu z encji HA
+            if (topic.equals(baseTopic + "/display/text")) {
+                showNotification("WIADOMOŚĆ", payload, "", 4000, "#FFA726", "#FFFFFF");
+                return;
+            }
+
+            // Wyświetlenie okrągłego łuku progresu (roleta, bateria, itp.)
+            if (topic.equals(baseTopic + "/display/progress")) {
+                int val = Integer.parseInt(payload);
+                publishRaw(baseTopic + "/display/progress_state", String.valueOf(val), true);
+                drawProgressArc(val, "ROLETA");
+                return;
+            }
+
+            // Własny JSON z kolorami
             if (topic.equals(baseTopic + "/display/custom")) {
                 JSONObject json = new JSONObject(payload);
                 showNotification(
@@ -278,6 +372,21 @@ public class BridgeService extends Service {
                 return;
             }
 
+            // Surowy obraz Base64
+            if (topic.equals(baseTopic + "/display/image")) {
+                byte[] decoded = Base64.decode(payload, Base64.DEFAULT);
+                Bitmap bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+                if (bmp != null) {
+                    isCustomScreenActive = true;
+                    Bitmap scaled = Bitmap.createScaledBitmap(bmp, 240, 240, true);
+                    renderToFramebuffer(scaled);
+                    handler.removeCallbacks(resetClockTask);
+                    handler.postDelayed(resetClockTask, 5000);
+                }
+                return;
+            }
+
+            // Włącznik zegara
             if (topic.equals(baseTopic + "/display/clock")) {
                 clockEnabled = !"off".equalsIgnoreCase(payload) && !"false".equalsIgnoreCase(payload);
                 if (!clockEnabled) {
@@ -290,6 +399,54 @@ public class BridgeService extends Service {
         } catch (Exception e) {
             Log.e(TAG, "Message handling error", e);
         }
+    }
+
+    // Nowoczesny okrągły łuk 240x240 z procentem na środku
+    private synchronized void drawProgressArc(int percent, String label) {
+        isCustomScreenActive = true;
+        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
+        Canvas canvas = new Canvas(bmp);
+        canvas.drawColor(Color.BLACK);
+
+        // Szare tło łuku
+        Paint arcBg = new Paint();
+        arcBg.setAntiAlias(true);
+        arcBg.setStyle(Paint.Style.STROKE);
+        arcBg.setStrokeWidth(16);
+        arcBg.setColor(Color.DKGRAY);
+        RectF rect = new RectF(28, 28, 212, 212);
+        canvas.drawArc(rect, 135, 270, false, arcBg);
+
+        // Aktywny łuk (morski błękit)
+        Paint arcFg = new Paint();
+        arcFg.setAntiAlias(true);
+        arcFg.setStyle(Paint.Style.STROKE);
+        arcFg.setStrokeWidth(16);
+        arcFg.setStrokeCap(Paint.Cap.ROUND);
+        arcFg.setColor(Color.parseColor("#00E5FF"));
+        float sweep = (270f * Math.max(0, Math.min(100, percent))) / 100f;
+        canvas.drawArc(rect, 135, sweep, false, arcFg);
+
+        // Wartość procentowa na środku
+        Paint textPaint = new Paint();
+        textPaint.setAntiAlias(true);
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        textPaint.setColor(Color.WHITE);
+        textPaint.setTextSize(54);
+        textPaint.setTypeface(Typeface.DEFAULT_BOLD);
+        canvas.drawText(percent + "%", 120, 132, textPaint);
+
+        // Etykieta pod spodem
+        Paint labelPaint = new Paint();
+        labelPaint.setAntiAlias(true);
+        labelPaint.setTextAlign(Paint.Align.CENTER);
+        labelPaint.setColor(Color.LTGRAY);
+        labelPaint.setTextSize(22);
+        canvas.drawText(label, 120, 175, labelPaint);
+
+        renderToFramebuffer(bmp);
+        handler.removeCallbacks(resetClockTask);
+        handler.postDelayed(resetClockTask, 3500);
     }
 
     private synchronized void showNotification(String title, String mainText, String sub, int durationMs, String titleColorHex, String textColorHex) {
@@ -308,13 +465,12 @@ public class BridgeService extends Service {
         canvas.drawText(title, 120, 55, paint);
 
         paint.setColor(Color.parseColor(textColorHex));
-        paint.setTextSize(mainText.length() > 6 ? 34 : 58);
+        paint.setTextSize(mainText.length() > 6 ? 32 : 54);
         canvas.drawText(mainText, 120, 135, paint);
 
         if (!sub.isEmpty()) {
             paint.setColor(Color.GRAY);
             paint.setTextSize(22);
-            paint.setTypeface(Typeface.DEFAULT);
             canvas.drawText(sub, 120, 195, paint);
         }
 
@@ -403,6 +559,7 @@ public class BridgeService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        running = false;
         try {
             unregisterReceiver(timeAndScreenReceiver);
             unregisterReceiver(hardwareVolumeReceiver);
