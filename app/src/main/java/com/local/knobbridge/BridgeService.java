@@ -33,6 +33,11 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+
 public class BridgeService extends Service {
     private static final String TAG = "KnobBridge";
     private static final File CONFIG_FILE = new File(Environment.getExternalStorageDirectory(), "knob_config.json");
@@ -82,33 +87,29 @@ public class BridgeService extends Service {
     }
 
     private void loadOrCreateConfig() {
-        try {
-            if (!CONFIG_FILE.exists()) {
-                JSONObject defaultCfg = new JSONObject();
-                defaultCfg.put("broker", "tcp://192.168.0.100:1883");
-                defaultCfg.put("user", "");
-                defaultCfg.put("password", "");
-                defaultCfg.put("base_topic", "panel");
-                FileOutputStream fos = new FileOutputStream(CONFIG_FILE);
-                fos.write(defaultCfg.toString(2).getBytes());
-                fos.close();
-                Log.i(TAG, "Created default config at " + CONFIG_FILE.getAbsolutePath());
-            }
+    SharedPreferences prefs = getSharedPreferences("knob_prefs", MODE_PRIVATE);
+    this.brokerUri = prefs.getString("broker", "tcp://192.168.0.7:1883");
+    this.mqttUser = prefs.getString("user", "admin");
+    this.mqttPass = prefs.getString("pass", "admin");
+    this.baseTopic = prefs.getString("topic", "panel");
+    Log.i(TAG, "Config loaded from prefs: broker=" + brokerUri);
 
-            FileInputStream fis = new FileInputStream(CONFIG_FILE);
-            byte[] buf = new byte[(int) CONFIG_FILE.length()];
-            fis.read(buf);
-            fis.close();
-            JSONObject cfg = new JSONObject(new String(buf));
-
-            this.brokerUri = cfg.optString("broker", this.brokerUri);
-            this.mqttUser = cfg.optString("user", this.mqttUser);
-            this.mqttPass = cfg.optString("password", this.mqttPass);
-            this.baseTopic = cfg.optString("base_topic", this.baseTopic);
-            Log.i(TAG, "Loaded config: broker=" + brokerUri + ", topic=" + baseTopic);
-        } catch (Exception e) {
-            Log.e(TAG, "Config load error, using defaults", e);
+    // Odbiornik do dynamicznej zmiany konfiguracji bez restartu
+    IntentFilter filter = new IntentFilter("com.local.knobbridge.SET_CONFIG");
+    registerReceiver(new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            SharedPreferences.Editor ed = prefs.edit();
+            if (intent.hasExtra("broker")) ed.putString("broker", intent.getStringExtra("broker"));
+            if (intent.hasExtra("user")) ed.putString("user", intent.getStringExtra("user"));
+            if (intent.hasExtra("pass")) ed.putString("pass", intent.getStringExtra("pass"));
+            if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
+            ed.apply();
+            Log.i(TAG, "Config updated via intent, reconnecting MQTT...");
+            loadOrCreateConfig();
+            initMqtt();
         }
+    }, filter, Context.RECEIVER_EXPORTED);
     }
 
     private void initMqtt() {
