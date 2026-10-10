@@ -4,14 +4,17 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -27,22 +30,16 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.json.JSONObject;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.IntentFilter;
-import android.content.SharedPreferences;
-
 public class BridgeService extends Service {
     private static final String TAG = "KnobBridge";
-    private static final File CONFIG_FILE = new File(Environment.getExternalStorageDirectory(), "knob_config.json");
 
-    private String brokerUri = "tcp://192.168.0.100:1883";
+    private String brokerUri = "tcp://192.168.0.7:1883";
     private String mqttUser = "";
     private String mqttPass = "";
     private String baseTopic = "panel";
@@ -51,11 +48,6 @@ public class BridgeService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean isCustomScreenActive = false;
     private boolean clockEnabled = true;
-
-    private int clockBgColor = Color.BLACK;
-    private int clockTimeColor = Color.WHITE;
-    private int clockSecColor = Color.parseColor("#FFA726");
-    private int clockDateColor = Color.LTGRAY;
 
     private final Runnable clockRunnable = new Runnable() {
         @Override
@@ -71,7 +63,8 @@ public class BridgeService extends Service {
     public void onCreate() {
         super.onCreate();
         startForegroundNoti();
-        loadOrCreateConfig();
+        wakeDisplayHardware();
+        loadConfigAndRegisterReceiver();
         initMqtt();
         handler.post(clockRunnable);
     }
@@ -86,30 +79,41 @@ public class BridgeService extends Service {
         startForeground(101, noti);
     }
 
-    private void loadOrCreateConfig() {
-    SharedPreferences prefs = getSharedPreferences("knob_prefs", MODE_PRIVATE);
-    this.brokerUri = prefs.getString("broker", "tcp://192.168.0.7:1883");
-    this.mqttUser = prefs.getString("user", "admin");
-    this.mqttPass = prefs.getString("pass", "admin");
-    this.baseTopic = prefs.getString("topic", "panel");
-    Log.i(TAG, "Config loaded from prefs: broker=" + brokerUri);
-
-    // Odbiornik do dynamicznej zmiany konfiguracji bez restartu
-    IntentFilter filter = new IntentFilter("com.local.knobbridge.SET_CONFIG");
-    registerReceiver(new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            SharedPreferences.Editor ed = prefs.edit();
-            if (intent.hasExtra("broker")) ed.putString("broker", intent.getStringExtra("broker"));
-            if (intent.hasExtra("user")) ed.putString("user", intent.getStringExtra("user"));
-            if (intent.hasExtra("pass")) ed.putString("pass", intent.getStringExtra("pass"));
-            if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
-            ed.apply();
-            Log.i(TAG, "Config updated via intent, reconnecting MQTT...");
-            loadOrCreateConfig();
-            initMqtt();
+    private void wakeDisplayHardware() {
+        try {
+            // Sprawdzona sekwencja wybudzania ekranu i nadania uprawnień
+            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", 
+                "echo on > /proc/vendor/lcd_ctrl && echo 1 > /proc/vendor/led_ctrl && chmod 666 /dev/graphics/fb1"});
+            p.waitFor();
+            Log.i(TAG, "Hardware display initialized (echo on > lcd_ctrl)");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to wake display", e);
         }
-    }, filter, Context.RECEIVER_EXPORTED);
+    }
+
+    private void loadConfigAndRegisterReceiver() {
+        SharedPreferences prefs = getSharedPreferences("knob_prefs", MODE_PRIVATE);
+        this.brokerUri = prefs.getString("broker", this.brokerUri);
+        this.mqttUser = prefs.getString("user", this.mqttUser);
+        this.mqttPass = prefs.getString("pass", this.mqttPass);
+        this.baseTopic = prefs.getString("topic", this.baseTopic);
+        Log.i(TAG, "Config: broker=" + brokerUri + ", topic=" + baseTopic);
+
+        IntentFilter filter = new IntentFilter("com.local.knobbridge.SET_CONFIG");
+        registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                SharedPreferences.Editor ed = prefs.edit();
+                if (intent.hasExtra("broker")) ed.putString("broker", intent.getStringExtra("broker"));
+                if (intent.hasExtra("user")) ed.putString("user", intent.getStringExtra("user"));
+                if (intent.hasExtra("pass")) ed.putString("pass", intent.getStringExtra("pass"));
+                if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
+                ed.apply();
+                Log.i(TAG, "Config updated via intent, reconnecting MQTT...");
+                loadConfigAndRegisterReceiver();
+                initMqtt();
+            }
+        }, filter, Context.RECEIVER_EXPORTED);
     }
 
     private void initMqtt() {
@@ -160,7 +164,6 @@ public class BridgeService extends Service {
         try {
             client.subscribe(baseTopic + "/volume/set/+");
             client.subscribe(baseTopic + "/display/#");
-            client.subscribe(baseTopic + "/config/#");
             Log.i(TAG, "Subscribed to " + baseTopic + "/#");
         } catch (Exception e) {
             Log.e(TAG, "Subscription error", e);
@@ -169,66 +172,56 @@ public class BridgeService extends Service {
 
     private void handleMessage(String topic, String payload) {
         try {
-            // 1. Zmiana głośności stref
             if (topic.startsWith(baseTopic + "/volume/set/")) {
                 int room = Integer.parseInt(topic.substring((baseTopic + "/volume/set/").length()));
                 int vol = Integer.parseInt(payload);
-                setHardwareVolume(room, vol);
+                Intent intent = new Intent("com.naner.volume.userchange");
+                intent.putExtra("room", room);
+                intent.putExtra("volume", vol);
+                sendBroadcast(intent);
+
                 showNotification("🔊 STREFA " + room, vol + "%", "Głośność", 3000, "#00E5FF", "#FFFFFF");
                 return;
             }
 
-            // 2. Własny dynamiczny ekran (JSON)
             if (topic.equals(baseTopic + "/display/custom")) {
                 JSONObject json = new JSONObject(payload);
-                String title = json.optString("title", "");
-                String text = json.optString("text", "");
-                String sub = json.optString("sub", "");
-                int duration = json.optInt("duration", 4000);
-                String titleColor = json.optString("title_color", "#4FC3F7");
-                String textColor = json.optString("text_color", "#FFFFFF");
-                showNotification(title, text, sub, duration, titleColor, textColor);
+                showNotification(
+                        json.optString("title", ""),
+                        json.optString("text", ""),
+                        json.optString("sub", ""),
+                        json.optInt("duration", 4000),
+                        json.optString("title_color", "#4FC3F7"),
+                        json.optString("text_color", "#FFFFFF")
+                );
                 return;
             }
 
-            // 3. Surowy Base64 obrazek
             if (topic.equals(baseTopic + "/display/image")) {
                 byte[] decoded = Base64.decode(payload, Base64.DEFAULT);
                 Bitmap bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
                 if (bmp != null) {
-                    showTemporaryBitmap(bmp, 5000);
+                    isCustomScreenActive = true;
+                    Bitmap scaled = Bitmap.createScaledBitmap(bmp, 240, 240, true);
+                    renderToFramebuffer(scaled);
+                    handler.removeCallbacks(resetClockTask);
+                    handler.postDelayed(resetClockTask, 5000);
                 }
                 return;
             }
 
-            // 4. Konfiguracja zegarka w locie
             if (topic.equals(baseTopic + "/display/clock")) {
-                if ("off".equalsIgnoreCase(payload) || "false".equalsIgnoreCase(payload)) {
-                    clockEnabled = false;
+                clockEnabled = !"off".equalsIgnoreCase(payload) && !"false".equalsIgnoreCase(payload);
+                if (!clockEnabled) {
                     clearScreen();
                 } else {
-                    clockEnabled = true;
                     isCustomScreenActive = false;
                     drawClock();
                 }
-                return;
-            }
-
-            // 5. Przeładowanie pliku konfiguracyjnego w locie bez restartu apki
-            if (topic.equals(baseTopic + "/config/reload")) {
-                loadOrCreateConfig();
-                initMqtt();
             }
         } catch (Exception e) {
-            Log.e(TAG, "Error handling topic: " + topic, e);
+            Log.e(TAG, "Error handling message", e);
         }
-    }
-
-    private void setHardwareVolume(int room, int volume) {
-        Intent intent = new Intent("com.naner.volume.userchange");
-        intent.putExtra("room", room);
-        intent.putExtra("volume", volume);
-        sendBroadcast(intent);
     }
 
     private synchronized void showNotification(String title, String mainText, String sub, int durationMs, String titleColorHex, String textColorHex) {
@@ -241,18 +234,15 @@ public class BridgeService extends Service {
         paint.setAntiAlias(true);
         paint.setTextAlign(Paint.Align.CENTER);
 
-        // Tytuł
         paint.setColor(Color.parseColor(titleColorHex));
         paint.setTextSize(26);
         paint.setTypeface(Typeface.DEFAULT_BOLD);
         canvas.drawText(title, 120, 55, paint);
 
-        // Treść główna
         paint.setColor(Color.parseColor(textColorHex));
         paint.setTextSize(mainText.length() > 6 ? 34 : 58);
         canvas.drawText(mainText, 120, 135, paint);
 
-        // Podtytuł
         if (!sub.isEmpty()) {
             paint.setColor(Color.GRAY);
             paint.setTextSize(22);
@@ -261,19 +251,6 @@ public class BridgeService extends Service {
         }
 
         renderToFramebuffer(bmp);
-
-        handler.removeCallbacks(resetClockTask);
-        if (durationMs > 0) {
-            handler.postDelayed(resetClockTask, durationMs);
-        }
-    }
-
-    private synchronized void showTemporaryBitmap(Bitmap source, int durationMs) {
-        isCustomScreenActive = true;
-        Bitmap scaled = Bitmap.createScaledBitmap(source, 240, 240, true);
-        renderToFramebuffer(scaled);
-        scaled.recycle();
-
         handler.removeCallbacks(resetClockTask);
         if (durationMs > 0) {
             handler.postDelayed(resetClockTask, durationMs);
@@ -290,33 +267,26 @@ public class BridgeService extends Service {
     private synchronized void drawClock() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(clockBgColor);
+        canvas.drawColor(Color.BLACK);
 
         Paint paint = new Paint();
         paint.setAntiAlias(true);
         paint.setTextAlign(Paint.Align.CENTER);
 
-        SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.getDefault());
-        SimpleDateFormat secFormat = new SimpleDateFormat("ss", Locale.getDefault());
-        SimpleDateFormat dateFormat = new SimpleDateFormat("EEE, d MMM", new Locale("pl", "PL"));
         Date now = new Date();
-
-        // Godzina
-        paint.setColor(clockTimeColor);
+        paint.setColor(Color.WHITE);
         paint.setTextSize(64);
         paint.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(timeFormat.format(now), 105, 130, paint);
+        canvas.drawText(new SimpleDateFormat("HH:mm", Locale.getDefault()).format(now), 105, 130, paint);
 
-        // Sekundy
-        paint.setColor(clockSecColor);
+        paint.setColor(Color.parseColor("#FFA726"));
         paint.setTextSize(26);
-        canvas.drawText(secFormat.format(now), 195, 130, paint);
+        canvas.drawText(new SimpleDateFormat("ss", Locale.getDefault()).format(now), 195, 130, paint);
 
-        // Data
-        paint.setColor(clockDateColor);
+        paint.setColor(Color.LTGRAY);
         paint.setTextSize(24);
         paint.setTypeface(Typeface.DEFAULT);
-        canvas.drawText(dateFormat.format(now), 120, 180, paint);
+        canvas.drawText(new SimpleDateFormat("EEE, d MMM", new Locale("pl", "PL")).format(now), 120, 180, paint);
 
         renderToFramebuffer(bmp);
     }
@@ -328,7 +298,6 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
-    // Bezpieczny, synchroniczny zapis do framebuffera (brak race condition z recycle)
     private synchronized void renderToFramebuffer(Bitmap bmp) {
         try {
             byte[] raw = new byte[240 * 240 * 2];
@@ -345,12 +314,24 @@ public class BridgeService extends Service {
                     raw[idx++] = (byte) ((rgb565 >> 8) & 0xFF);
                 }
             }
-            bmp.recycle();
 
-            FileOutputStream fos = new FileOutputStream("/dev/graphics/fb1");
-            fos.write(raw);
-            fos.flush();
-            fos.close();
+            // Zapisujemy bezpośrednio lub przez proces shella, jeśli SELinux rzuca błędem
+            File fb = new File("/dev/graphics/fb1");
+            if (fb.canWrite()) {
+                FileOutputStream fos = new FileOutputStream(fb);
+                fos.write(raw);
+                fos.flush();
+                fos.close();
+            } else {
+                Process process = Runtime.getRuntime().exec("sh");
+                OutputStream os = process.getOutputStream();
+                os.write(("cat > /dev/graphics/fb1\n").getBytes());
+                os.flush();
+                os.write(raw);
+                os.flush();
+                os.close();
+                process.waitFor();
+            }
         } catch (Exception e) {
             Log.e(TAG, "Framebuffer write error", e);
         }
