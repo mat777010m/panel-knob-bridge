@@ -11,6 +11,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -18,13 +19,15 @@ import android.util.Base64;
 import android.util.Log;
 
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
-import org.eclipse.paho.client.mqttv3.MqttCallback;
+import org.eclipse.paho.client.mqttv3.MqttCallbackExtended;
 import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.json.JSONObject;
 
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -32,21 +35,27 @@ import java.util.Locale;
 
 public class BridgeService extends Service {
     private static final String TAG = "KnobBridge";
+    private static final File CONFIG_FILE = new File(Environment.getExternalStorageDirectory(), "knob_config.json");
 
-    // === KONFIGURACJA MQTT (Zmień na IP swojego HA) ===
-    private static final String MQTT_BROKER = "tcp://192.168.1.50:1883";
-    private static final String MQTT_USER = "";
-    private static final String MQTT_PASS = "";
+    private String brokerUri = "tcp://192.168.0.100:1883";
+    private String mqttUser = "";
+    private String mqttPass = "";
+    private String baseTopic = "panel";
 
     private MqttClient client;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean isCustomScreenActive = false;
+    private boolean clockEnabled = true;
 
-    // Zadanie odświeżające zegarek co 1 sekundę
+    private int clockBgColor = Color.BLACK;
+    private int clockTimeColor = Color.WHITE;
+    private int clockSecColor = Color.parseColor("#FFA726");
+    private int clockDateColor = Color.LTGRAY;
+
     private final Runnable clockRunnable = new Runnable() {
         @Override
         public void run() {
-            if (!isCustomScreenActive) {
+            if (!isCustomScreenActive && clockEnabled) {
                 drawClock();
             }
             handler.postDelayed(this, 1000);
@@ -57,7 +66,8 @@ public class BridgeService extends Service {
     public void onCreate() {
         super.onCreate();
         startForegroundNoti();
-        connectMqtt();
+        loadOrCreateConfig();
+        initMqtt();
         handler.post(clockRunnable);
     }
 
@@ -71,26 +81,67 @@ public class BridgeService extends Service {
         startForeground(101, noti);
     }
 
-    private void connectMqtt() {
+    private void loadOrCreateConfig() {
+        try {
+            if (!CONFIG_FILE.exists()) {
+                JSONObject defaultCfg = new JSONObject();
+                defaultCfg.put("broker", "tcp://192.168.0.100:1883");
+                defaultCfg.put("user", "");
+                defaultCfg.put("password", "");
+                defaultCfg.put("base_topic", "panel");
+                FileOutputStream fos = new FileOutputStream(CONFIG_FILE);
+                fos.write(defaultCfg.toString(2).getBytes());
+                fos.close();
+                Log.i(TAG, "Created default config at " + CONFIG_FILE.getAbsolutePath());
+            }
+
+            FileInputStream fis = new FileInputStream(CONFIG_FILE);
+            byte[] buf = new byte[(int) CONFIG_FILE.length()];
+            fis.read(buf);
+            fis.close();
+            JSONObject cfg = new JSONObject(new String(buf));
+
+            this.brokerUri = cfg.optString("broker", this.brokerUri);
+            this.mqttUser = cfg.optString("user", this.mqttUser);
+            this.mqttPass = cfg.optString("password", this.mqttPass);
+            this.baseTopic = cfg.optString("base_topic", this.baseTopic);
+            Log.i(TAG, "Loaded config: broker=" + brokerUri + ", topic=" + baseTopic);
+        } catch (Exception e) {
+            Log.e(TAG, "Config load error, using defaults", e);
+        }
+    }
+
+    private void initMqtt() {
         new Thread(() -> {
             try {
-                client = new MqttClient(MQTT_BROKER, "PanelTablet_" + System.currentTimeMillis(), new MemoryPersistence());
+                if (client != null && client.isConnected()) {
+                    client.disconnect();
+                }
+                client = new MqttClient(brokerUri, "PanelKnob_" + System.currentTimeMillis(), new MemoryPersistence());
                 MqttConnectOptions opts = new MqttConnectOptions();
                 opts.setCleanSession(true);
                 opts.setAutomaticReconnect(true);
-                if (MQTT_USER != null && !MQTT_USER.isEmpty()) {
-                    opts.setUserName(MQTT_USER);
-                    opts.setPassword(MQTT_PASS.toCharArray());
+                opts.setConnectionTimeout(10);
+                if (!mqttUser.isEmpty()) {
+                    opts.setUserName(mqttUser);
+                    opts.setPassword(mqttPass.toCharArray());
                 }
 
-                client.setCallback(new MqttCallback() {
+                client.setCallback(new MqttCallbackExtended() {
                     @Override
-                    public void connectionLost(Throwable cause) {}
+                    public void connectComplete(boolean reconnect, String serverURI) {
+                        Log.i(TAG, "MQTT Connected to " + serverURI);
+                        subscribeTopics();
+                    }
+
+                    @Override
+                    public void connectionLost(Throwable cause) {
+                        Log.w(TAG, "MQTT Connection lost", cause);
+                    }
 
                     @Override
                     public void messageArrived(String topic, MqttMessage message) {
-                        String payload = new String(message.getPayload()).trim();
-                        handleIncomingMqtt(topic, payload);
+                        handleMessage(topic, new String(message.getPayload()).trim());
                     }
 
                     @Override
@@ -98,47 +149,77 @@ public class BridgeService extends Service {
                 });
 
                 client.connect(opts);
-                client.subscribe("panel/volume/set/+");
-                client.subscribe("panel/display/custom");
-                client.subscribe("panel/display/image");
-                client.subscribe("panel/display/clock");
-                Log.i(TAG, "Connected to MQTT broker");
             } catch (Exception e) {
-                Log.e(TAG, "MQTT Connection error", e);
+                Log.e(TAG, "MQTT init failed: " + e.getMessage());
             }
         }).start();
     }
 
-    private void handleIncomingMqtt(String topic, String payload) {
+    private void subscribeTopics() {
         try {
-            if (topic.equals("panel/volume/set/1")) {
+            client.subscribe(baseTopic + "/volume/set/+");
+            client.subscribe(baseTopic + "/display/#");
+            client.subscribe(baseTopic + "/config/#");
+            Log.i(TAG, "Subscribed to " + baseTopic + "/#");
+        } catch (Exception e) {
+            Log.e(TAG, "Subscription error", e);
+        }
+    }
+
+    private void handleMessage(String topic, String payload) {
+        try {
+            // 1. Zmiana głośności stref
+            if (topic.startsWith(baseTopic + "/volume/set/")) {
+                int room = Integer.parseInt(topic.substring((baseTopic + "/volume/set/").length()));
                 int vol = Integer.parseInt(payload);
-                setHardwareVolume(1, vol);
-                showTemporaryMessage("🔊 STREFA 1", vol + "%", "Głośność", 3000);
-            } else if (topic.equals("panel/volume/set/2")) {
-                int vol = Integer.parseInt(payload);
-                setHardwareVolume(2, vol);
-                showTemporaryMessage("🔊 STREFA 2", vol + "%", "Głośność", 3000);
-            } else if (topic.equals("panel/display/custom")) {
-                // Format JSON: {"title":"🔔 Domofon","text":"Ktoś dzwoni!","sub":"Wejście","duration":5000}
+                setHardwareVolume(room, vol);
+                showNotification("🔊 STREFA " + room, vol + "%", "Głośność", 3000, "#00E5FF", "#FFFFFF");
+                return;
+            }
+
+            // 2. Własny dynamiczny ekran (JSON)
+            if (topic.equals(baseTopic + "/display/custom")) {
                 JSONObject json = new JSONObject(payload);
                 String title = json.optString("title", "");
                 String text = json.optString("text", "");
                 String sub = json.optString("sub", "");
                 int duration = json.optInt("duration", 4000);
-                showTemporaryMessage(title, text, sub, duration);
-            } else if (topic.equals("panel/display/image")) {
-                // Base64 lub czyste PNG/JPEG
+                String titleColor = json.optString("title_color", "#4FC3F7");
+                String textColor = json.optString("text_color", "#FFFFFF");
+                showNotification(title, text, sub, duration, titleColor, textColor);
+                return;
+            }
+
+            // 3. Surowy Base64 obrazek
+            if (topic.equals(baseTopic + "/display/image")) {
                 byte[] decoded = Base64.decode(payload, Base64.DEFAULT);
                 Bitmap bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
                 if (bmp != null) {
                     showTemporaryBitmap(bmp, 5000);
                 }
-            } else if (topic.equals("panel/display/clock")) {
-                resetToClock();
+                return;
+            }
+
+            // 4. Konfiguracja zegarka w locie
+            if (topic.equals(baseTopic + "/display/clock")) {
+                if ("off".equalsIgnoreCase(payload) || "false".equalsIgnoreCase(payload)) {
+                    clockEnabled = false;
+                    clearScreen();
+                } else {
+                    clockEnabled = true;
+                    isCustomScreenActive = false;
+                    drawClock();
+                }
+                return;
+            }
+
+            // 5. Przeładowanie pliku konfiguracyjnego w locie bez restartu apki
+            if (topic.equals(baseTopic + "/config/reload")) {
+                loadOrCreateConfig();
+                initMqtt();
             }
         } catch (Exception e) {
-            Log.e(TAG, "Error processing MQTT message: " + topic, e);
+            Log.e(TAG, "Error handling topic: " + topic, e);
         }
     }
 
@@ -149,7 +230,7 @@ public class BridgeService extends Service {
         sendBroadcast(intent);
     }
 
-    private void showTemporaryMessage(String title, String mainText, String sub, int durationMs) {
+    private synchronized void showNotification(String title, String mainText, String sub, int durationMs, String titleColorHex, String textColorHex) {
         isCustomScreenActive = true;
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -159,18 +240,18 @@ public class BridgeService extends Service {
         paint.setAntiAlias(true);
         paint.setTextAlign(Paint.Align.CENTER);
 
-        // Tytuł / Emotka u góry
-        paint.setColor(Color.parseColor("#4FC3F7"));
+        // Tytuł
+        paint.setColor(Color.parseColor(titleColorHex));
         paint.setTextSize(26);
         paint.setTypeface(Typeface.DEFAULT_BOLD);
         canvas.drawText(title, 120, 55, paint);
 
-        // Główny tekst / liczba
-        paint.setColor(Color.WHITE);
-        paint.setTextSize(mainText.length() > 5 ? 36 : 60);
+        // Treść główna
+        paint.setColor(Color.parseColor(textColorHex));
+        paint.setTextSize(mainText.length() > 6 ? 34 : 58);
         canvas.drawText(mainText, 120, 135, paint);
 
-        // Podtytuł na dole
+        // Podtytuł
         if (!sub.isEmpty()) {
             paint.setColor(Color.GRAY);
             paint.setTextSize(22);
@@ -179,34 +260,36 @@ public class BridgeService extends Service {
         }
 
         renderToFramebuffer(bmp);
-        bmp.recycle();
 
         handler.removeCallbacks(resetClockTask);
-        handler.postDelayed(resetClockTask, durationMs);
+        if (durationMs > 0) {
+            handler.postDelayed(resetClockTask, durationMs);
+        }
     }
 
-    private void showTemporaryBitmap(Bitmap source, int durationMs) {
+    private synchronized void showTemporaryBitmap(Bitmap source, int durationMs) {
         isCustomScreenActive = true;
         Bitmap scaled = Bitmap.createScaledBitmap(source, 240, 240, true);
         renderToFramebuffer(scaled);
         scaled.recycle();
-        source.recycle();
 
         handler.removeCallbacks(resetClockTask);
-        handler.postDelayed(resetClockTask, durationMs);
+        if (durationMs > 0) {
+            handler.postDelayed(resetClockTask, durationMs);
+        }
     }
 
-    private final Runnable resetClockTask = this::resetToClock;
-
-    private void resetToClock() {
+    private final Runnable resetClockTask = () -> {
         isCustomScreenActive = false;
-        drawClock();
-    }
+        if (clockEnabled) {
+            drawClock();
+        }
+    };
 
     private synchronized void drawClock() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
+        canvas.drawColor(clockBgColor);
 
         Paint paint = new Paint();
         paint.setAntiAlias(true);
@@ -217,53 +300,59 @@ public class BridgeService extends Service {
         SimpleDateFormat dateFormat = new SimpleDateFormat("EEE, d MMM", new Locale("pl", "PL"));
         Date now = new Date();
 
-        // Duża godzina
-        paint.setColor(Color.WHITE);
+        // Godzina
+        paint.setColor(clockTimeColor);
         paint.setTextSize(64);
         paint.setTypeface(Typeface.DEFAULT_BOLD);
         canvas.drawText(timeFormat.format(now), 105, 130, paint);
 
-        // Mniejsze sekundy obok
-        paint.setColor(Color.parseColor("#FFA726"));
+        // Sekundy
+        paint.setColor(clockSecColor);
         paint.setTextSize(26);
         canvas.drawText(secFormat.format(now), 195, 130, paint);
 
-        // Data na dole
-        paint.setColor(Color.LTGRAY);
+        // Data
+        paint.setColor(clockDateColor);
         paint.setTextSize(24);
         paint.setTypeface(Typeface.DEFAULT);
         canvas.drawText(dateFormat.format(now), 120, 180, paint);
 
         renderToFramebuffer(bmp);
-        bmp.recycle();
     }
 
-    private void renderToFramebuffer(Bitmap bmp) {
-        new Thread(() -> {
-            try {
-                byte[] raw = new byte[240 * 240 * 2];
-                int idx = 0;
-                // Skalowanie/odbicie lustrzane w osi X zgodne z chińskim NRLcd
-                for (int y = 0; y < 240; y++) {
-                    for (int x = 239; x >= 0; x--) {
-                        int p = bmp.getPixel(x, y);
-                        int r = (p >> 16) & 0xFF;
-                        int g = (p >> 8) & 0xFF;
-                        int b = p & 0xFF;
-                        int rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    private synchronized void clearScreen() {
+        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
+        Canvas canvas = new Canvas(bmp);
+        canvas.drawColor(Color.BLACK);
+        renderToFramebuffer(bmp);
+    }
 
-                        raw[idx++] = (byte) (rgb565 & 0xFF);
-                        raw[idx++] = (byte) ((rgb565 >> 8) & 0xFF);
-                    }
+    // Bezpieczny, synchroniczny zapis do framebuffera (brak race condition z recycle)
+    private synchronized void renderToFramebuffer(Bitmap bmp) {
+        try {
+            byte[] raw = new byte[240 * 240 * 2];
+            int idx = 0;
+            for (int y = 0; y < 240; y++) {
+                for (int x = 239; x >= 0; x--) {
+                    int p = bmp.getPixel(x, y);
+                    int r = (p >> 16) & 0xFF;
+                    int g = (p >> 8) & 0xFF;
+                    int b = p & 0xFF;
+                    int rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+
+                    raw[idx++] = (byte) (rgb565 & 0xFF);
+                    raw[idx++] = (byte) ((rgb565 >> 8) & 0xFF);
                 }
-                FileOutputStream fos = new FileOutputStream("/dev/graphics/fb1");
-                fos.write(raw);
-                fos.flush();
-                fos.close();
-            } catch (Exception e) {
-                Log.e(TAG, "Framebuffer write error", e);
             }
-        }).start();
+            bmp.recycle();
+
+            FileOutputStream fos = new FileOutputStream("/dev/graphics/fb1");
+            fos.write(raw);
+            fos.flush();
+            fos.close();
+        } catch (Exception e) {
+            Log.e(TAG, "Framebuffer write error", e);
+        }
     }
 
     @Override
