@@ -95,6 +95,16 @@ public class BridgeService extends Service {
         startForegroundNoti();
         loadConfigAndRegisterReceiver();
 
+        // Utrzymanie procesora na chodzie (bez ekranu)
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        PowerManager.WakeLock wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KnobBridge::CpuLock");
+        wakeLock.acquire();
+
+        // Utrzymanie Wi-Fi w trybie High Performance
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        WifiManager.WifiLock wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KnobBridge::WifiLock");
+        wifiLock.acquire();
+
         // Pełne zasilenie ekranu na start
         setHardwarePower(true);
 
