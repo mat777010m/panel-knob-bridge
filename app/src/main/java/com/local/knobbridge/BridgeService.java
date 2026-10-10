@@ -351,6 +351,8 @@ public class BridgeService extends Service {
                 MqttConnectOptions opts = new MqttConnectOptions();
                 opts.setCleanSession(true);
                 opts.setAutomaticReconnect(true);
+                opts.setKeepAliveInterval(20);
+                opts.setConnectionTimeout(10);
                 if (!mqttUser.isEmpty()) {
                     opts.setUserName(mqttUser);
                     opts.setPassword(mqttPass.toCharArray());
@@ -570,22 +572,24 @@ public class BridgeService extends Service {
     }
 
     private void animateGaugeToValue(int targetVal) {
-        float range = Math.max(1, gaugeMax - gaugeMin);
-        float pct = ((float)(targetVal - gaugeMin)) / range;
-        float targetSweep = 270f * Math.max(0f, Math.min(1f, pct));
+        handler.post(() -> {
+            float range = Math.max(1, gaugeMax - gaugeMin);
+            float pct = ((float)(targetVal - gaugeMin)) / range;
+            float targetSweep = 270f * Math.max(0f, Math.min(1f, pct));
 
-        if (gaugeAnimator != null && gaugeAnimator.isRunning()) {
-            gaugeAnimator.cancel();
-        }
+            if (gaugeAnimator != null && gaugeAnimator.isRunning()) {
+                gaugeAnimator.cancel();
+            }
 
-        gaugeAnimator = ValueAnimator.ofFloat(animatedSweep, targetSweep);
-        gaugeAnimator.setDuration(120);
-        gaugeAnimator.setInterpolator(new DecelerateInterpolator());
-        gaugeAnimator.addUpdateListener(anim -> {
-            animatedSweep = (float) anim.getAnimatedValue();
-            drawGaugeScreen();
+            gaugeAnimator = ValueAnimator.ofFloat(animatedSweep, targetSweep);
+            gaugeAnimator.setDuration(120);
+            gaugeAnimator.setInterpolator(new DecelerateInterpolator());
+            gaugeAnimator.addUpdateListener(anim -> {
+                animatedSweep = (float) anim.getAnimatedValue();
+                drawGaugeScreen();
+            });
+            gaugeAnimator.start();
         });
-        gaugeAnimator.start();
     }
 
     // 1. ZEGAR
