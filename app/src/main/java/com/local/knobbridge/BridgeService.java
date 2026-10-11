@@ -67,7 +67,7 @@ public class BridgeService extends Service {
 
     // Flagi sprzętowe
     private boolean isMainScreenOn = true;
-    private boolean isScreenHardwarePowered = true;
+    private volatile boolean isScreenHardwarePowered = true;
     private boolean isMicActive = false;
     private boolean isMicMuted = false;
 
@@ -76,7 +76,7 @@ public class BridgeService extends Service {
     private String alertBadgeText = "";
     private boolean isAlertKeepingAwake = false;
 
-    // Tryby pracy
+    // Tryby pracy ekranu
     private enum ScreenMode { CLOCK, GAUGE, MENU, MEDIA, ALERT }
     private ScreenMode currentMode = ScreenMode.CLOCK;
 
@@ -104,7 +104,7 @@ public class BridgeService extends Service {
     private String mediaSub = "";
     private int mediaProgress = -1;
 
-    // Odbiornik zdarzeń ekranu
+    // Synchronizacja z głównym ekranem tabletu
     private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -127,15 +127,20 @@ public class BridgeService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        Log.i(TAG, "Startowanie usługi BridgeService...");
         startForegroundNoti();
         acquireLocks();
         loadConfigAndRegisterReceiver();
 
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        initUartHardware();
         initMicMonitoring();
 
-        setHardwarePower(true);
+        // Wszystkie operacje blokujące I/O odpalamy w osobnym wątku (nie zamraża startu!)
+        new Thread(() -> {
+            initUartHardware();
+            setHardwarePower(true);
+            drawClock();
+        }).start();
 
         IntentFilter filter = new IntentFilter();
         filter.addAction(Intent.ACTION_SCREEN_OFF);
@@ -145,7 +150,6 @@ public class BridgeService extends Service {
 
         startRootInputMonitoring();
         initMqtt();
-        drawClock();
     }
 
     private void acquireLocks() {
@@ -160,7 +164,10 @@ public class BridgeService extends Service {
                 wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KnobBridge::WifiLock");
                 wifiLock.acquire();
             }
-        } catch (Exception ignored) {}
+            Log.i(TAG, "WakeLock i WifiLock zapięte pomyślnie");
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd blokad zasilania", e);
+        }
     }
 
     private void startForegroundNoti() {
@@ -175,88 +182,105 @@ public class BridgeService extends Service {
 
     // --- MAGISTRALA DSP AUDIO (/dev/ttyAS4) ---
     private void initUartHardware() {
-        runRootCmd("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && chmod 666 /dev/ttyAS4");
+        runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && chmod 666 /dev/ttyAS4");
+        Log.i(TAG, "Magistrala UART /dev/ttyAS4 zainicjalizowana");
     }
 
-    private synchronized void sendDspFrame(int cmd, int val, int room) {
-        byte[] frame = new byte[6];
-        frame[0] = (byte) 0xFA;
-        frame[1] = (byte) 0x01;
-        frame[2] = (byte) (cmd & 0xFF);
-        frame[3] = (byte) (val & 0xFF);
-        frame[4] = (byte) (room & 0xFF);
-        frame[5] = (byte) ((0xFA + 0x01 + (cmd & 0xFF) + (val & 0xFF) + (room & 0xFF)) & 0xFF);
+    private void sendDspFrame(int cmd, int val, int room) {
+        new Thread(() -> {
+            byte[] frame = new byte[6];
+            frame[0] = (byte) 0xFA;
+            frame[1] = (byte) 0x01;
+            frame[2] = (byte) (cmd & 0xFF);
+            frame[3] = (byte) (val & 0xFF);
+            frame[4] = (byte) (room & 0xFF);
+            frame[5] = (byte) ((0xFA + 0x01 + (cmd & 0xFF) + (val & 0xFF) + (room & 0xFF)) & 0xFF);
 
-        try {
-            File f = new File("/dev/ttyAS4");
-            if (f.canWrite()) {
-                FileOutputStream fos = new FileOutputStream(f);
-                fos.write(frame);
-                fos.flush();
-                fos.close();
-            } else {
-                Process p = Runtime.getRuntime().exec(new String[]{"su", "0"});
-                OutputStream os = p.getOutputStream();
-                os.write("cat > /dev/ttyAS4\n".getBytes());
-                os.flush();
-                os.write(frame);
-                os.flush();
-                os.close();
-                p.waitFor();
+            try {
+                File f = new File("/dev/ttyAS4");
+                if (f.canWrite()) {
+                    FileOutputStream fos = new FileOutputStream(f);
+                    fos.write(frame);
+                    fos.flush();
+                    fos.close();
+                } else {
+                    Process p = Runtime.getRuntime().exec(new String[]{"su", "0"});
+                    OutputStream os = p.getOutputStream();
+                    os.write("cat > /dev/ttyAS4\n".getBytes());
+                    os.flush();
+                    os.write(frame);
+                    os.flush();
+                    os.close();
+                    p.waitFor();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "DSP write error", e);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "DSP write error", e);
-        }
+        }).start();
     }
 
     // --- MONITORING I KONTROLA MIKROFONU ---
     private void initMicMonitoring() {
         if (audioManager != null) {
-            isMicMuted = audioManager.isMicrophoneMute();
+            try {
+                isMicMuted = audioManager.isMicrophoneMute();
+            } catch (Exception ignored) {}
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                audioManager.registerAudioRecordingCallback(new AudioManager.AudioRecordingCallback() {
-                    @Override
-                    public void onRecordingConfigChanged(List<AudioRecordingConfiguration> configs) {
-                        boolean active = (configs != null && !configs.isEmpty());
-                        if (isMicActive != active) {
-                            isMicActive = active;
-                            publishRaw(baseTopic + "/mic/active/state", active ? "ON" : "OFF", true);
-                            if (currentMode == ScreenMode.CLOCK) {
-                                handler.post(() -> drawClock());
+                try {
+                    audioManager.registerAudioRecordingCallback(new AudioManager.AudioRecordingCallback() {
+                        @Override
+                        public void onRecordingConfigChanged(List<AudioRecordingConfiguration> configs) {
+                            boolean active = (configs != null && !configs.isEmpty());
+                            if (isMicActive != active) {
+                                isMicActive = active;
+                                publishRaw(baseTopic + "/mic/active/state", active ? "ON" : "OFF", true);
+                                if (currentMode == ScreenMode.CLOCK) {
+                                    handler.post(() -> drawClock());
+                                }
                             }
                         }
-                    }
-                }, handler);
+                    }, handler);
+                } catch (Exception e) {
+                    Log.e(TAG, "Błąd rejestracji callbacku mikrofonu", e);
+                }
             }
         }
     }
 
     private void setMicrophoneMute(boolean mute) {
         if (audioManager != null) {
-            audioManager.setMicrophoneMute(mute);
-            isMicMuted = audioManager.isMicrophoneMute();
-            publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-            if (currentMode == ScreenMode.CLOCK) {
-                drawClock();
+            try {
+                audioManager.setMicrophoneMute(mute);
+                isMicMuted = audioManager.isMicrophoneMute();
+                publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
+                if (currentMode == ScreenMode.CLOCK) {
+                    drawClock();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Błąd zmiany stanu mikrofonu", e);
             }
         }
     }
 
-    // --- ZASILANIE EKRANU I LED ---
-    private synchronized void setHardwarePower(boolean enable) {
+    // --- ZASILANIE EKRANU I LED (Asynchroniczne, nie blokuje wątku) ---
+    private void setHardwarePower(boolean enable) {
         isScreenHardwarePowered = enable;
-        runRootCmd(enable ? "echo on > /proc/vendor/lcd_ctrl && echo 0 > /sys/class/graphics/fb1/blank && chmod 666 /dev/graphics/fb1"
-                          : "echo off > /proc/vendor/lcd_ctrl && echo 4 > /sys/class/graphics/fb1/blank");
-        publishRaw(baseTopic + "/display/state", enable ? "on" : "off", true);
+        new Thread(() -> {
+            runRootCmdSync(enable ? "echo on > /proc/vendor/lcd_ctrl && echo 0 > /sys/class/graphics/fb1/blank && chmod 666 /dev/graphics/fb1"
+                                  : "echo off > /proc/vendor/lcd_ctrl && echo 4 > /sys/class/graphics/fb1/blank");
+            publishRaw(baseTopic + "/display/state", enable ? "on" : "off", true);
+        }).start();
     }
 
-    private synchronized void setLedRingHardware(boolean enable) {
-        runRootCmd(enable ? "echo on > /proc/vendor/led_ctrl" : "echo off > /proc/vendor/led_ctrl");
-        publishRaw(baseTopic + "/led/state", enable ? "on" : "off", true);
+    private void setLedRingHardware(boolean enable) {
+        new Thread(() -> {
+            runRootCmdSync(enable ? "echo on > /proc/vendor/led_ctrl" : "echo off > /proc/vendor/led_ctrl");
+            publishRaw(baseTopic + "/led/state", enable ? "on" : "off", true);
+        }).start();
     }
 
-    private void runRootCmd(String cmd) {
+    private void runRootCmdSync(String cmd) {
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"su", "0"});
             OutputStream os = p.getOutputStream();
@@ -268,7 +292,7 @@ public class BridgeService extends Service {
         }
     }
 
-    // --- CZYTANIE ENKODERA ---
+    // --- CZYTANIE ENKODERA /dev/input/event0 ---
     private void startRootInputMonitoring() {
         new Thread(() -> {
             while (running) {
@@ -432,6 +456,7 @@ public class BridgeService extends Service {
                 client.setCallback(new MqttCallbackExtended() {
                     @Override
                     public void connectComplete(boolean reconnect, String serverURI) {
+                        Log.i(TAG, "MQTT Connected to " + serverURI);
                         subscribeTopics();
                         publishHomeAssistantDiscovery();
                         publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
@@ -439,7 +464,9 @@ public class BridgeService extends Service {
                     }
 
                     @Override
-                    public void connectionLost(Throwable cause) {}
+                    public void connectionLost(Throwable cause) {
+                        Log.w(TAG, "MQTT Connection lost: " + (cause != null ? cause.getMessage() : "unknown"));
+                    }
 
                     @Override
                     public void messageArrived(String topic, MqttMessage message) {
@@ -451,7 +478,9 @@ public class BridgeService extends Service {
                 });
 
                 client.connect(opts);
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                Log.e(TAG, "MQTT Connect error: " + e.getMessage());
+            }
         }).start();
     }
 
@@ -464,8 +493,9 @@ public class BridgeService extends Service {
         } catch (Exception ignored) {}
     }
 
-    // --- REJESTRACJA W HA (Zintegrowane urządzenie) ---
+    // --- REJESTRACJA W HA (Kuloodporne Auto-Discovery z logowaniem) ---
     private void publishHomeAssistantDiscovery() {
+        Log.i(TAG, "Rozpoczynam publikację Home Assistant Discovery...");
         try {
             JSONObject device = new JSONObject();
             device.put("identifiers", new JSONArray().put("panel_knob_engine_v4"));
@@ -473,78 +503,144 @@ public class BridgeService extends Service {
             device.put("model", "Allwinner DSP Knob 240x240");
             device.put("manufacturer", "Smart Home Lab");
 
-            // Event i sensory akcji
-            publishDiscovery("event", "action_event", "Zdarzenie Gałki", "knob_event_trigger_v4",
-                    new JSONObject().put("state_topic", baseTopic + "/knob/event")
-                            .put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click")), device);
+            // 1. Zdarzenie obrotu/kliku
+            try {
+                JSONObject ev = new JSONObject();
+                ev.put("name", "Zdarzenie Gałki");
+                ev.put("unique_id", "knob_event_trigger_v4");
+                ev.put("state_topic", baseTopic + "/knob/event");
+                ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
+                ev.put("device", device);
+                publishRaw("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd event discovery", e); }
 
-            publishDiscovery("sensor", "confirm_val", "Zatwierdzona Wartość", "knob_confirm_val_v4",
-                    new JSONObject().put("state_topic", baseTopic + "/knob/confirm").put("icon", "mdi:check-circle-outline"), device);
+            // 2. Sensor akcji
+            try {
+                JSONObject act = new JSONObject();
+                act.put("name", "Akcja Gałki");
+                act.put("unique_id", "knob_action_sensor_v4");
+                act.put("state_topic", baseTopic + "/knob/action");
+                act.put("force_update", true);
+                act.put("icon", "mdi:rotate-right");
+                act.put("device", device);
+                publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd action sensor discovery", e); }
 
-            publishDiscovery("switch", "power", "Zasilanie Ekraniku", "knob_power_switch_v4",
-                    new JSONObject().put("command_topic", baseTopic + "/display/power").put("state_topic", baseTopic + "/display/state")
-                            .put("payload_on", "on").put("payload_off", "off").put("icon", "mdi:power"), device);
+            // 3. Sensor zatwierdzonej wartości
+            try {
+                JSONObject conf = new JSONObject();
+                conf.put("name", "Zatwierdzona Wartość");
+                conf.put("unique_id", "knob_confirm_val_v4");
+                conf.put("state_topic", baseTopic + "/knob/confirm");
+                conf.put("icon", "mdi:check-circle-outline");
+                conf.put("device", device);
+                publishRaw("homeassistant/sensor/panel_knob/confirm/config", conf.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd confirm sensor discovery", e); }
 
-            publishDiscovery("switch", "led_ring", "Pierścień LED", "knob_led_ring_v4",
-                    new JSONObject().put("command_topic", baseTopic + "/led/set").put("state_topic", baseTopic + "/led/state")
-                            .put("payload_on", "on").put("payload_off", "off").put("icon", "mdi:led-strip-variant"), device);
+            // 4. Przełącznik ekranu
+            try {
+                JSONObject pwr = new JSONObject();
+                pwr.put("name", "Zasilanie Ekraniku");
+                pwr.put("unique_id", "knob_power_switch_v4");
+                pwr.put("command_topic", baseTopic + "/display/power");
+                pwr.put("state_topic", baseTopic + "/display/state");
+                pwr.put("payload_on", "on");
+                pwr.put("payload_off", "off");
+                pwr.put("icon", "mdi:power");
+                pwr.put("device", device);
+                publishRaw("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd power switch discovery", e); }
 
-            // Mikrofon
-            publishDiscovery("switch", "mic_mute", "Wyciszenie Mikrofonu", "knob_mic_mute",
-                    new JSONObject().put("command_topic", baseTopic + "/mic/mute/set").put("state_topic", baseTopic + "/mic/mute/state")
-                            .put("payload_on", "ON").put("payload_off", "OFF").put("icon", "mdi:microphone-off"), device);
+            // 5. Przełącznik LED
+            try {
+                JSONObject led = new JSONObject();
+                led.put("name", "Pierścień LED");
+                led.put("unique_id", "knob_led_ring_v4");
+                led.put("command_topic", baseTopic + "/led/set");
+                led.put("state_topic", baseTopic + "/led/state");
+                led.put("payload_on", "on");
+                led.put("payload_off", "off");
+                led.put("icon", "mdi:led-strip-variant");
+                led.put("device", device);
+                publishRaw("homeassistant/switch/panel_knob/led_ring/config", led.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd led switch discovery", e); }
 
-            publishDiscovery("binary_sensor", "mic_active", "Mikrofon Używany", "knob_mic_active",
-                    new JSONObject().put("state_topic", baseTopic + "/mic/active/state").put("payload_on", "ON").put("payload_off", "OFF")
-                            .put("icon", "mdi:microphone"), device);
+            // 6. Wyciszenie mikrofonu
+            try {
+                JSONObject micM = new JSONObject();
+                micM.put("name", "Wyciszenie Mikrofonu");
+                micM.put("unique_id", "knob_mic_mute_v4");
+                micM.put("command_topic", baseTopic + "/mic/mute/set");
+                micM.put("state_topic", baseTopic + "/mic/mute/state");
+                micM.put("payload_on", "ON");
+                micM.put("payload_off", "OFF");
+                micM.put("icon", "mdi:microphone-off");
+                micM.put("device", device);
+                publishRaw("homeassistant/switch/panel_knob/mic_mute/config", micM.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd mic mute discovery", e); }
 
-            // Strefa 1 (Master, L, P)
+            // 7. Mikrofon aktywny
+            try {
+                JSONObject micA = new JSONObject();
+                micA.put("name", "Mikrofon Używany");
+                micA.put("unique_id", "knob_mic_active_v4");
+                micA.put("state_topic", baseTopic + "/mic/active/state");
+                micA.put("payload_on", "ON");
+                micA.put("payload_off", "OFF");
+                micA.put("icon", "mdi:microphone");
+                micA.put("device", device);
+                publishRaw("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd mic active discovery", e); }
+
+            // 8. Strefa 1 DSP (Master, L, P)
             registerNumberEntity("dsp_z1_master", "Strefa 1 Głośność Główna", baseTopic + "/dsp/z1/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z1_left", "Strefa 1 Głośnik Lewy", baseTopic + "/dsp/z1/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z1_right", "Strefa 1 Głośnik Prawy", baseTopic + "/dsp/z1/right", 0, 20, "mdi:speaker", device);
 
-            // Strefa 2 (Master, L, P)
+            // 9. Strefa 2 DSP (Master, L, P)
             registerNumberEntity("dsp_z2_master", "Strefa 2 Głośność Główna", baseTopic + "/dsp/z2/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z2_left", "Strefa 2 Głośnik Lewy", baseTopic + "/dsp/z2/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z2_right", "Strefa 2 Głośnik Prawy", baseTopic + "/dsp/z2/right", 0, 20, "mdi:speaker", device);
 
-            // Equalizer EQ
+            // 10. Equalizer EQ (Basy, Soprany)
             registerNumberEntity("dsp_eq_bass", "Korektor Basy", baseTopic + "/dsp/eq/bass", -10, 10, "mdi:equalizer", device);
             registerNumberEntity("dsp_eq_treble", "Korektor Soprany", baseTopic + "/dsp/eq/treble", -10, 10, "mdi:equalizer", device);
 
-            // Profil EQ
-            JSONObject eqProf = new JSONObject();
-            eqProf.put("name", "Profil Dźwięku EQ");
-            eqProf.put("unique_id", "knob_dsp_eq_mode");
-            eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
-            eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
-            eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
-            eqProf.put("icon", "mdi:music-box-outline");
-            eqProf.put("device", device);
-            publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
+            // 11. Profil EQ
+            try {
+                JSONObject eqProf = new JSONObject();
+                eqProf.put("name", "Profil Dźwięku EQ");
+                eqProf.put("unique_id", "knob_dsp_eq_mode_v4");
+                eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
+                eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
+                eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
+                eqProf.put("icon", "mdi:music-box-outline");
+                eqProf.put("device", device);
+                publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Błąd eq select discovery", e); }
 
-        } catch (Exception ignored) {}
+            Log.i(TAG, "Wszystkie encje MQTT Discovery wysłane pomyślnie!");
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd główny discovery", e);
+        }
     }
 
-    private void registerNumberEntity(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) throws Exception {
-        JSONObject obj = new JSONObject();
-        obj.put("name", name);
-        obj.put("unique_id", "knob_" + id);
-        obj.put("command_topic", topicPrefix + "/set");
-        obj.put("state_topic", topicPrefix + "/state");
-        obj.put("min", min);
-        obj.put("max", max);
-        obj.put("mode", "slider");
-        obj.put("icon", icon);
-        obj.put("device", device);
-        publishRaw("homeassistant/number/panel_knob/" + id + "/config", obj.toString(), true);
-    }
-
-    private void publishDiscovery(String domain, String id, String name, String uid, JSONObject data, JSONObject device) throws Exception {
-        data.put("name", name);
-        data.put("unique_id", uid);
-        data.put("device", device);
-        publishRaw("homeassistant/" + domain + "/panel_knob/" + id + "/config", data.toString(), true);
+    private void registerNumberEntity(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) {
+        try {
+            JSONObject obj = new JSONObject();
+            obj.put("name", name);
+            obj.put("unique_id", "knob_" + id + "_v4");
+            obj.put("command_topic", topicPrefix + "/set");
+            obj.put("state_topic", topicPrefix + "/state");
+            obj.put("min", min);
+            obj.put("max", max);
+            obj.put("mode", "slider");
+            obj.put("icon", icon);
+            obj.put("device", device);
+            publishRaw("homeassistant/number/panel_knob/" + id + "/config", obj.toString(), true);
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd rejestracji encji number: " + id, e);
+        }
     }
 
     // --- OBSŁUGA ROZKAZÓW MQTT ---
@@ -629,7 +725,7 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // Sprzęt ekran/LED
+            // Zasilanie ekranu / LED
             if (topic.equals(baseTopic + "/display/power")) {
                 setHardwarePower("on".equalsIgnoreCase(payload));
                 if (isScreenHardwarePowered) redrawCurrentScreen();
@@ -640,7 +736,7 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // Czyszczenie alertu
+            // Czyszczenie alertu z poziomu HA
             if (topic.equals(baseTopic + "/display/alert/clear")) {
                 hasUnreadAlert = false;
                 alertBadgeText = "";
@@ -703,7 +799,7 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // ALERT (Brak sztywnego "ALARM" i "Kliknij=Odczytano")
+            // ALERT (Brak sztywnego "ALARM" i stopki)
             if (topic.equals(baseTopic + "/display/alert")) {
                 JSONObject j = new JSONObject(payload);
                 String title = j.optString("title", "");
@@ -749,6 +845,7 @@ public class BridgeService extends Service {
         else drawClock();
     }
 
+    // Bezpieczna animacja łuku w pętli głównej Main Looper
     private void animateGaugeToValue(int targetVal) {
         handler.post(() -> {
             float range = Math.max(1, gaugeMax - gaugeMin);
@@ -770,9 +867,9 @@ public class BridgeService extends Service {
         });
     }
 
-    // --- RYSOWANIE GRAFIKI (Czysty framework bez sztywnych napisów) ---
+    // --- RYSOWANIE GRAFIKI ---
 
-    // 1. ZEGAR (Z dynamicznym statusem mikrofonu i alertu)
+    // 1. ZEGAR (Ze statusem mikrofonu i alertu)
     private synchronized void drawClock() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -782,7 +879,6 @@ public class BridgeService extends Service {
         p.setAntiAlias(true);
         p.setTextAlign(Paint.Align.CENTER);
 
-        // Pasek statusu u góry
         if (isMicMuted) {
             p.setColor(Color.parseColor("#FFA000")); // Bursztyn
             p.setTextSize(16);
