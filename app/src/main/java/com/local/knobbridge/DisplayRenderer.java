@@ -12,7 +12,6 @@ public class DisplayRenderer {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final HardwareManager hw;
 
-    // Stałe bufory pamięci - zero alokacji podczas renderowania
     private final Bitmap canvasBmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
     private final Canvas canvas = new Canvas(canvasBmp);
     private final int[] pixelsBuf = new int[240 * 240];
@@ -22,13 +21,12 @@ public class DisplayRenderer {
     private final Paint arcPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF arcRect = new RectF();
 
-    private String currentLayout = "stack";
+    private String currentLayout = "clock";
     private JSONObject currentData = new JSONObject();
 
     private boolean hasAlert = false;
     private String alertText = "";
 
-    // Animacja dial
     private float currentSweep = 0f;
     private ValueAnimator dialAnimator;
 
@@ -47,7 +45,7 @@ public class DisplayRenderer {
     }
 
     public synchronized void setLayout(String layout, JSONObject data) {
-        this.currentLayout = layout != null ? layout : "stack";
+        this.currentLayout = layout != null ? layout : "clock";
         this.currentData = data != null ? data : new JSONObject();
         render();
     }
@@ -82,7 +80,9 @@ public class DisplayRenderer {
 
     public void animateDialSweep(float targetSweep) {
         handler.post(() -> {
-            if (dialAnimator != null && dialAnimator.isRunning()) dialAnimator.cancel();
+            if (dialAnimator != null && dialAnimator.isRunning()) {
+                dialAnimator.cancel();
+            }
             dialAnimator = ValueAnimator.ofFloat(currentSweep, targetSweep);
             dialAnimator.setDuration(90);
             dialAnimator.setInterpolator(new DecelerateInterpolator());
@@ -103,16 +103,24 @@ public class DisplayRenderer {
         drawCustomStatusBar();
 
         switch (currentLayout) {
-            case "dial": drawDialSkeleton(); break;
+            case "dial":
+                drawDialSkeleton();
+                break;
             case "carousel":
-            case "menu": drawCarouselSkeleton(); break;
+            case "menu":
+                drawCarouselSkeleton();
+                break;
             case "progress":
-            case "media": drawProgressSkeleton(); break;
+            case "media":
+                drawProgressSkeleton();
+                break;
             case "stack":
             case "card":
             case "alert":
             case "clock":
-            default: drawStackSkeleton(); break;
+            default:
+                drawStackSkeleton();
+                break;
         }
 
         pushToHardware();
@@ -290,7 +298,9 @@ public class DisplayRenderer {
             }
         }
         hw.writeRawFramebuffer(rawFbBuf);
-        if (listener != null) listener.onFrameReady(canvasBmp);
+        if (listener != null) {
+            listener.onFrameReady(canvasBmp);
+        }
     }
 
     private int parseHex(String hex, int fallback) {

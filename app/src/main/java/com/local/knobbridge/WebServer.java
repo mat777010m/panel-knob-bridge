@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 public class WebServer {
     private static final String TAG = "KnobWeb";
     private final int port = 6767;
+
     private final ConfigManager cfg;
     private final DisplayRenderer renderer;
     private final HardwareManager hw;
@@ -28,7 +29,6 @@ public class WebServer {
         this.hw = hw;
         this.mqtt = mqtt;
 
-        // Podgląd na żywo aktualizowany przy każdej klatce
         renderer.setRenderListener(bmp -> {
             try {
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -66,7 +66,6 @@ public class WebServer {
                 String method = parts[0];
                 String path = parts[1];
 
-                // Czytanie nagłówków
                 String authHeader = "";
                 int contentLength = 0;
                 while ((line = in.readLine()) != null && !line.isEmpty()) {
@@ -77,14 +76,12 @@ public class WebServer {
                     }
                 }
 
-                // Autoryzacja Basic Auth
                 if (!checkAuth(authHeader)) {
                     send401(out);
                     sock.close();
                     return;
                 }
 
-                // API
                 if (path.equals("/api/frame")) {
                     sendJson(out, "{\"image\":\"data:image/png;base64," + lastFrameBase64 + "\"}");
                 } else if (path.equals("/api/config") && method.equals("GET")) {
@@ -93,16 +90,15 @@ public class WebServer {
                     char[] body = new char[contentLength];
                     in.read(body, 0, contentLength);
                     boolean ok = cfg.save(new String(body));
-                    if (ok) mqtt.start(); // Przeładowanie reguł i discovery
+                    if (ok) mqtt.start();
                     sendJson(out, "{\"success\":" + ok + "}");
                 } else if (path.equals("/api/test_ui") && method.equals("POST")) {
                     char[] body = new char[contentLength];
                     in.read(body, 0, contentLength);
                     JSONObject j = new JSONObject(new String(body));
-                    renderer.setTemplate(j.optString("template", "clock"), j);
+                    renderer.setLayout(j.optString("layout", j.optString("template", "clock")), j);
                     sendJson(out, "{\"status\":\"ok\"}");
                 } else {
-                    // Strona główna z edytorem i okrągłym symulatorem
                     sendHtml(out, getWebUiHtml());
                 }
                 sock.close();
@@ -146,7 +142,6 @@ public class WebServer {
         out.write(bytes);
     }
 
-    // Wbudowany interfejs webowy (Ciemny motyw, symulator z ramką, edytor JSON)
     private String getWebUiHtml() {
         return "<!DOCTYPE html><html lang='pl'><head><meta charset='utf-8'>"
             + "<title>Knob Controller OS</title>"
@@ -160,9 +155,6 @@ public class WebServer {
             + "textarea{width:100%;flex:1;background:#1e1e1e;color:#00e5ff;border:1px solid #333;border-radius:6px;font-family:monospace;padding:12px;font-size:14px;box-sizing:border-box;}"
             + "button{background:#00e5ff;color:#000;border:none;padding:12px 20px;font-weight:bold;cursor:pointer;border-radius:4px;margin-top:10px;}"
             + "button:hover{background:#00b4cc;}"
-            + ".tabs{display:flex;gap:10px;margin-bottom:10px;}"
-            + ".tab-btn{background:#333;color:#fff;padding:8px 16px;border-radius:4px;cursor:pointer;}"
-            + ".tab-btn.active{background:#00e5ff;color:#000;}"
             + "</style></head><body>"
             + "<div class='left'>"
             + "<h2>Podgląd Gałki</h2>"
@@ -188,6 +180,8 @@ public class WebServer {
 
     public void stop() {
         this.running = false;
-        try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
+        try {
+            if (serverSocket != null) serverSocket.close();
+        } catch (Exception ignored) {}
     }
 }

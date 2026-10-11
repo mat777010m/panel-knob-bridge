@@ -8,6 +8,7 @@ import org.json.JSONObject;
 
 public class RuleEngine {
     private static final String TAG = "KnobRules";
+
     private final ConfigManager configMgr;
     private final HardwareManager hw;
     private final DisplayRenderer renderer;
@@ -15,11 +16,22 @@ public class RuleEngine {
 
     private MqttManager mqtt;
     private Runnable screenOffTimer;
+    private final Runnable timeoutCancelTask;
 
     public RuleEngine(ConfigManager cfg, HardwareManager hw, DisplayRenderer rend) {
         this.configMgr = cfg;
         this.hw = hw;
         this.renderer = rend;
+
+        this.timeoutCancelTask = () -> {
+            String tpl = renderer.getCurrentLayout();
+            if ("dial".equals(tpl) || "menu".equals(tpl) || "carousel".equals(tpl)) {
+                if (mqtt != null) {
+                    mqtt.publish("panel/knob/cancel", "{\"layout\":\"" + tpl + "\"}", false);
+                }
+            }
+            renderer.setLayout("clock", new JSONObject());
+        };
     }
 
     public void setMqtt(MqttManager mqtt) {
@@ -52,7 +64,9 @@ public class RuleEngine {
                 int sec = r.optInt("seconds", 300);
                 hw.setScreenPower(true);
                 renderer.render();
-                if (screenOffTimer != null) handler.removeCallbacks(screenOffTimer);
+                if (screenOffTimer != null) {
+                    handler.removeCallbacks(screenOffTimer);
+                }
                 screenOffTimer = () -> hw.setScreenPower(false);
                 handler.postDelayed(screenOffTimer, (long) sec * 1000);
                 break;
@@ -69,14 +83,6 @@ public class RuleEngine {
         }
     }
 
-    private final Runnable timeoutCancelTask = () -> {
-        String tpl = renderer.getCurrentLayout();
-        if ("dial".equals(tpl) || "menu".equals(tpl) || "carousel".equals(tpl)) {
-            if (mqtt != null) mqtt.publish("panel/knob/cancel", "{\"layout\":\"" + tpl + "\"}", false);
-        }
-        renderer.setLayout("clock", new JSONObject());
-    };
-
     public void onKnobTurn(int delta) {
         if (!hw.isScreenPowered()) {
             hw.setScreenPower(true);
@@ -84,7 +90,9 @@ public class RuleEngine {
             return;
         }
 
-        if (mqtt != null) mqtt.publish("panel/knob/action", delta > 0 ? "rotate_right" : "rotate_left", false);
+        if (mqtt != null) {
+            mqtt.publish("panel/knob/action", delta > 0 ? "rotate_right" : "rotate_left", false);
+        }
 
         String tpl = renderer.getCurrentLayout();
         JSONObject data = renderer.getCurrentData();
@@ -96,17 +104,23 @@ public class RuleEngine {
             int step = data.optInt("step", 5);
 
             val = Math.max(min, Math.min(max, val + (delta * step)));
-            try { data.put("value", val); } catch (Exception ignored) {}
+            try {
+                data.put("value", val);
+            } catch (Exception ignored) {}
 
             renderer.animateDial(val, min, max);
-            if (mqtt != null) mqtt.publish("panel/knob/value", String.valueOf(val), false);
+            if (mqtt != null) {
+                mqtt.publish("panel/knob/value", String.valueOf(val), false);
+            }
             resetTimeout(5000);
         } else if ("menu".equals(tpl) || "carousel".equals(tpl)) {
             JSONArray arr = data.optJSONArray("items");
             if (arr != null && arr.length() > 0) {
                 int idx = data.optInt("selected_index", 0);
                 idx = (idx + delta + arr.length()) % arr.length();
-                try { data.put("selected_index", idx); } catch (Exception ignored) {}
+                try {
+                    data.put("selected_index", idx);
+                } catch (Exception ignored) {}
                 renderer.render();
                 resetTimeout(5000);
             }
@@ -120,19 +134,25 @@ public class RuleEngine {
             return;
         }
 
-        if (mqtt != null) mqtt.publish("panel/knob/action", "click", false);
+        if (mqtt != null) {
+            mqtt.publish("panel/knob/action", "click", false);
+        }
 
         String tpl = renderer.getCurrentLayout();
         JSONObject data = renderer.getCurrentData();
 
         if ("dial".equals(tpl)) {
-            if (mqtt != null) mqtt.publish("panel/knob/confirm", String.valueOf(data.optInt("value", 0)), false);
+            if (mqtt != null) {
+                mqtt.publish("panel/knob/confirm", String.valueOf(data.optInt("value", 0)), false);
+            }
             renderer.setLayout("clock", new JSONObject());
         } else if ("menu".equals(tpl) || "carousel".equals(tpl)) {
             JSONArray arr = data.optJSONArray("items");
             int idx = data.optInt("selected_index", 0);
             if (arr != null && idx < arr.length()) {
-                if (mqtt != null) mqtt.publish("panel/knob/menu_select", arr.optString(idx, ""), false);
+                if (mqtt != null) {
+                    mqtt.publish("panel/knob/menu_select", arr.optString(idx, ""), false);
+                }
             }
             renderer.setLayout("clock", new JSONObject());
         } else if ("alert".equals(tpl)) {
@@ -143,6 +163,8 @@ public class RuleEngine {
 
     private void resetTimeout(int ms) {
         handler.removeCallbacks(timeoutCancelTask);
-        if (ms > 0) handler.postDelayed(timeoutCancelTask, ms);
+        if (ms > 0) {
+            handler.postDelayed(timeoutCancelTask, ms);
+        }
     }
 }

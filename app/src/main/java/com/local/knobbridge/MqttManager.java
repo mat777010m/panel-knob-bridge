@@ -8,6 +8,7 @@ import org.json.JSONObject;
 
 public class MqttManager {
     private static final String TAG = "KnobMqtt";
+
     private final ConfigManager cfg;
     private final RuleEngine rules;
     private final DisplayRenderer renderer;
@@ -33,7 +34,9 @@ public class MqttManager {
                 String user = mCfg.optString("user", "");
                 String pass = mCfg.optString("pass", "");
 
-                if (client != null && client.isConnected()) client.disconnect();
+                if (client != null && client.isConnected()) {
+                    client.disconnect();
+                }
                 client = new MqttClient(broker, "KnobModular_" + System.currentTimeMillis(), new MemoryPersistence());
 
                 MqttConnectOptions opts = new MqttConnectOptions();
@@ -53,7 +56,9 @@ public class MqttManager {
                         publishDynamicDiscovery();
                     }
                     @Override
-                    public void connectionLost(Throwable cause) { isConnected = false; }
+                    public void connectionLost(Throwable cause) {
+                        isConnected = false;
+                    }
                     @Override
                     public void messageArrived(String topic, MqttMessage message) {
                         handleMessage(topic, new String(message.getPayload()).trim());
@@ -78,14 +83,12 @@ public class MqttManager {
 
     private void handleMessage(String topic, String payload) {
         try {
-            // Bezpośredni szkielet UI z HA
             if ("panel/ui/set".equals(topic)) {
                 JSONObject j = new JSONObject(payload);
-                renderer.setTemplate(j.optString("template", "clock"), j);
+                renderer.setLayout(j.optString("layout", j.optString("template", "clock")), j);
                 return;
             }
 
-            // Sterowanie sprzętem
             if ("panel/display/power".equals(topic)) {
                 hw.setScreenPower("on".equalsIgnoreCase(payload));
                 renderer.render();
@@ -96,33 +99,34 @@ public class MqttManager {
                 return;
             }
             if ("panel/hardware/mic/mute".equals(topic)) {
-                hw.setMicMute("true".equalsIgnoreCase(payload) || "1".equals(payload));
+                boolean mute = "true".equalsIgnoreCase(payload) || "1".equals(payload);
+                hw.setMicMute(mute);
+                publish("panel/hardware/mic/state", mute ? "true" : "false", true);
                 renderer.render();
                 return;
             }
-            // Sterowanie dźwiękiem DSP przez MQTT
-            if (topic.equals("panel/audio/zone1/volume")) {
+
+            if ("panel/audio/zone1/volume".equals(topic)) {
                 int vol = Integer.parseInt(payload);
                 hw.setZone1Volume(vol);
                 publish("panel/audio/zone1/volume/state", String.valueOf(vol), true);
                 return;
             }
-            if (topic.equals("panel/audio/zone2/volume")) {
+            if ("panel/audio/zone2/volume".equals(topic)) {
                 int vol = Integer.parseInt(payload);
                 hw.setZone2Volume(vol);
                 publish("panel/audio/zone2/volume/state", String.valueOf(vol), true);
                 return;
             }
-            if (topic.equals("panel/audio/zone1/bass")) {
+            if ("panel/audio/zone1/bass".equals(topic)) {
                 hw.setZone1Bass(Integer.parseInt(payload));
                 return;
             }
-            if (topic.equals("panel/audio/zone1/treble")) {
+            if ("panel/audio/zone1/treble".equals(topic)) {
                 hw.setZone1Treble(Integer.parseInt(payload));
                 return;
             }
 
-            // Silnik reguł z JSON-a
             rules.processMqtt(topic, payload);
         } catch (Exception e) {
             Log.e(TAG, "Błąd obsługi MQTT", e);
@@ -136,7 +140,38 @@ public class MqttManager {
             dev.put("name", "Gałka Panel");
             dev.put("manufacturer", "Smart Home Lab");
 
-            // Rejestracja encji z pliku config.json
+            JSONObject ev = new JSONObject();
+            ev.put("name", "Zdarzenie Gałki");
+            ev.put("unique_id", "knob_event_trigger");
+            ev.put("state_topic", "panel/knob/event");
+            ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
+            ev.put("device", dev);
+            publish("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
+
+            JSONObject z1 = new JSONObject();
+            z1.put("name", "Głośność Strefa 1");
+            z1.put("unique_id", "knob_dsp_zone1_vol");
+            z1.put("command_topic", "panel/audio/zone1/volume");
+            z1.put("state_topic", "panel/audio/zone1/volume/state");
+            z1.put("min", 0);
+            z1.put("max", 16);
+            z1.put("step", 1);
+            z1.put("icon", "mdi:volume-high");
+            z1.put("device", dev);
+            publish("homeassistant/number/panel_knob/zone1_volume/config", z1.toString(), true);
+
+            JSONObject z2 = new JSONObject();
+            z2.put("name", "Głośność Strefa 2");
+            z2.put("unique_id", "knob_dsp_zone2_vol");
+            z2.put("command_topic", "panel/audio/zone2/volume");
+            z2.put("state_topic", "panel/audio/zone2/volume/state");
+            z2.put("min", 0);
+            z2.put("max", 16);
+            z2.put("step", 1);
+            z2.put("icon", "mdi:volume-high");
+            z2.put("device", dev);
+            publish("homeassistant/number/panel_knob/zone2_volume/config", z2.toString(), true);
+
             JSONArray list = cfg.getConfig().optJSONArray("discovery");
             if (list != null) {
                 for (int i = 0; i < list.length(); i++) {
@@ -155,31 +190,6 @@ public class MqttManager {
                     publish("homeassistant/" + type + "/panel_knob/" + id + "/config", disc.toString(), true);
                 }
             }
-            // Encja w HA: Głośność Strefa 1 (0-16)
-            JSONObject z1 = new JSONObject();
-            z1.put("name", "Głośność Strefa 1");
-            z1.put("unique_id", "knob_dsp_zone1_vol");
-            z1.put("command_topic", "panel/audio/zone1/volume");
-            z1.put("state_topic", "panel/audio/zone1/volume/state");
-            z1.put("min", 0);
-            z1.put("max", 16);
-            z1.put("step", 1);
-            z1.put("icon", "mdi:volume-high");
-            z1.put("device", dev);
-            publish("homeassistant/number/panel_knob/zone1_volume/config", z1.toString(), true);
-
-            // Encja w HA: Głośność Strefa 2 (0-16)
-            JSONObject z2 = new JSONObject();
-            z2.put("name", "Głośność Strefa 2");
-            z2.put("unique_id", "knob_dsp_zone2_vol");
-            z2.put("command_topic", "panel/audio/zone2/volume");
-            z2.put("state_topic", "panel/audio/zone2/volume/state");
-            z2.put("min", 0);
-            z2.put("max", 16);
-            z2.put("step", 1);
-            z2.put("icon", "mdi:volume-high");
-            z2.put("device", dev);
-            publish("homeassistant/number/panel_knob/zone2_volume/config", z2.toString(), true);
         } catch (Exception ignored) {}
     }
 
@@ -196,6 +206,8 @@ public class MqttManager {
     public boolean isConnected() { return isConnected; }
 
     public void stop() {
-        try { if (client != null) client.disconnect(); } catch (Exception ignored) {}
+        try {
+            if (client != null) client.disconnect();
+        } catch (Exception ignored) {}
     }
 }

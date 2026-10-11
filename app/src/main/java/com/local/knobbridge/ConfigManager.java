@@ -74,10 +74,8 @@ public class ConfigManager {
             mqtt.put("base_topic", "panel");
             root.put("mqtt", mqtt);
 
-            // Dynamiczne reguły: mapowanie zdarzeń na akcje bez ruszania Javy
             JSONArray rules = new JSONArray();
 
-            // Reguła 1: Ruch w kuchni budzi ekran z zegarem na 5 minut
             JSONObject r1 = new JSONObject();
             r1.put("trigger", "mqtt");
             r1.put("topic", "kuchnia/ruch");
@@ -86,7 +84,6 @@ public class ConfigManager {
             r1.put("seconds", 300);
             rules.put(r1);
 
-            // Reguła 2: Przykładowy zapis UART do wzmacniacza stref
             JSONObject r2 = new JSONObject();
             r2.put("trigger", "mqtt");
             r2.put("topic", "panel/hardware/uart");
@@ -95,7 +92,6 @@ public class ConfigManager {
 
             root.put("rules", rules);
 
-            // Dynamiczne encje Home Assistanta generowane przez Discovery
             JSONArray discovery = new JSONArray();
             JSONObject d1 = new JSONObject();
             d1.put("type", "switch");

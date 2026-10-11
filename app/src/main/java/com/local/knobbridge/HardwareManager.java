@@ -7,6 +7,7 @@ import java.io.*;
 
 public class HardwareManager {
     private static final String TAG = "KnobHardware";
+
     private final Context context;
     private boolean isScreenPowered = true;
     private boolean isLedRingOn = false;
@@ -16,10 +17,6 @@ public class HardwareManager {
 
     private OutputStream fbOutputStream;
     private OutputStream uartOutputStream;
-
-    public synchronized void writeUart(String payload) {
-        runRoot("echo -e -n '" + payload + "' > /dev/ttyAS4");
-    }
 
     public interface InputCallback {
         void onRotate(int delta);
@@ -32,12 +29,9 @@ public class HardwareManager {
         initUartPort();
     }
 
-    // Inicjalizacja UART 9600 baud pod DSP Yamaha YDA174
     private void initUartPort() {
         try {
-            // Ustawiamy port na 9600 8N1 raw przez roota
             runRoot("chmod 666 /dev/ttyAS4 && stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb raw -echo");
-
             File uartFile = new File("/dev/ttyAS4");
             if (uartFile.canWrite()) {
                 uartOutputStream = new BufferedOutputStream(new FileOutputStream(uartFile), 64);
@@ -48,10 +42,9 @@ public class HardwareManager {
         }
     }
 
-    // Wysyłanie 6-bajtowej ramki binarnej do DSP
     public synchronized void sendDspCommand(int cmd, int val) {
-        val = Math.max(0, Math.min(16, val)); // Bezpieczny zakres 0-16
-        int cs = (0xFA + 0x00 + cmd) & 0xFF;  // Suma kontrolna wg specyfikacji
+        val = Math.max(0, Math.min(16, val));
+        int cs = (0xFA + 0x00 + cmd) & 0xFF;
 
         byte[] frame = new byte[] {
             (byte) 0xFA,
@@ -74,13 +67,16 @@ public class HardwareManager {
         }
     }
 
-    // Szybkie metody pomocnicze dla stref
     public void setZone1Volume(int vol) { sendDspCommand(0x55, vol); }
     public void setZone2Volume(int vol) { sendDspCommand(0x56, vol); }
     public void setZone1Bass(int val)   { sendDspCommand(0x4A, val); }
     public void setZone1Treble(int val) { sendDspCommand(0x49, val); }
     public void setZone2Bass(int val)   { sendDspCommand(0x4C, val); }
     public void setZone2Treble(int val) { sendDspCommand(0x4B, val); }
+
+    public synchronized void writeUart(String payload) {
+        runRoot("echo -e -n '" + payload + "' > /dev/ttyAS4");
+    }
 
     private void initFramebufferPipe() {
         try {
