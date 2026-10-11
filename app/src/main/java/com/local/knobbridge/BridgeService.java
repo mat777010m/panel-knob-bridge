@@ -967,7 +967,7 @@ public class BridgeService extends Service {
         if (!menuFooter.isEmpty()) {
             p.setColor(Color.GRAY);
             p.setTextSize(16);
-            tp.setTypeface(Typeface.DEFAULT);
+            p.setTypeface(Typeface.DEFAULT);
             canvas.drawText(menuFooter, 120, 195, p);
         }
 
