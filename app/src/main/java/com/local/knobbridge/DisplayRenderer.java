@@ -25,6 +25,9 @@ public class DisplayRenderer {
     private String currentLayout = "stack";
     private JSONObject currentData = new JSONObject();
 
+    private boolean hasAlert = false;
+    private String alertText = "";
+
     // Animacja dial
     private float currentSweep = 0f;
     private ValueAnimator dialAnimator;
@@ -49,11 +52,32 @@ public class DisplayRenderer {
         render();
     }
 
+    // Aliasy dla zgodności z resztą klas
+    public synchronized void setTemplate(String tpl, JSONObject data) {
+        setLayout(tpl, data);
+    }
+
+    public String getCurrentLayout() { return currentLayout; }
+    public String getCurrentTemplate() { return currentLayout; }
+    public JSONObject getCurrentData() { return currentData; }
+
+    public synchronized void setAlert(boolean active, String text) {
+        this.hasAlert = active;
+        this.alertText = text != null ? text : "";
+        render();
+    }
+
+    public void animateDial(int val, int min, int max) {
+        float pct = ((float)(val - min)) / Math.max(1, max - min);
+        float targetSweep = 270f * Math.max(0f, Math.min(1f, pct));
+        animateDialSweep(targetSweep);
+    }
+
     public void animateDialSweep(float targetSweep) {
         handler.post(() -> {
             if (dialAnimator != null && dialAnimator.isRunning()) dialAnimator.cancel();
             dialAnimator = ValueAnimator.ofFloat(currentSweep, targetSweep);
-            dialAnimator.setDuration(90); // 90ms = idealna responsywność bez smużenia
+            dialAnimator.setDuration(90);
             dialAnimator.setInterpolator(new DecelerateInterpolator());
             dialAnimator.addUpdateListener(anim -> {
                 currentSweep = (float) anim.getAnimatedValue();
@@ -66,29 +90,29 @@ public class DisplayRenderer {
     public synchronized void render() {
         if (!hw.isScreenPowered()) return;
 
-        // Czyść ekran do koloru tła z JSON (domyślnie czarny)
         int bgColor = parseHex(currentData.optString("bg_color", "#000000"), Color.BLACK);
         canvas.drawColor(bgColor);
 
-        // Opcjonalny pasek statusu w rogu (np. MIC OFF, ikona alarmu)
         drawCustomStatusBar();
 
         switch (currentLayout) {
             case "dial": drawDialSkeleton(); break;
-            case "carousel": drawCarouselSkeleton(); break;
-            case "progress": drawProgressSkeleton(); break;
+            case "carousel":
+            case "menu": drawCarouselSkeleton(); break;
+            case "progress":
+            case "media": drawProgressSkeleton(); break;
             case "stack":
+            case "card":
+            case "alert":
+            case "clock":
             default: drawStackSkeleton(); break;
         }
 
         pushToHardware();
     }
 
-    // 1. SZKIELET PIONOWY (STACK) - uniwersalny na zegary, sensory, alerty
     private void drawStackSkeleton() {
         paint.setTextAlign(Paint.Align.CENTER);
-
-        // Od 1 do 4 w pełni konfigurowalnych linii
         for (int i = 1; i <= 4; i++) {
             String text = currentData.optString("line" + i, "");
             if (!text.isEmpty()) {
@@ -101,9 +125,7 @@ public class DisplayRenderer {
         }
     }
 
-    // 2. SZKIELET POKRĘTŁA (DIAL) - mechanika łukowa
     private void drawDialSkeleton() {
-        // Podziałka kreskowa dookoła (opcjonalna)
         if (currentData.optBoolean("show_ticks", true)) {
             paint.setColor(parseHex(currentData.optString("ticks_color", "#333333"), Color.DKGRAY));
             paint.setStrokeWidth(currentData.optInt("ticks_width", 2));
@@ -118,23 +140,19 @@ public class DisplayRenderer {
             }
         }
 
-        // Geometria łuku z JSON
         int arcInset = currentData.optInt("arc_inset", 28);
         arcRect.set(arcInset, arcInset, 240 - arcInset, 240 - arcInset);
         int strokeW = currentData.optInt("arc_width", 14);
 
-        // Tło łuku
         arcPaint.setStrokeWidth(strokeW);
         arcPaint.setColor(parseHex(currentData.optString("track_color", "#222222"), Color.DKGRAY));
         arcPaint.setStrokeCap(Paint.Cap.BUTT);
         canvas.drawArc(arcRect, 135, 270, false, arcPaint);
 
-        // Aktywny pasek animowany
         arcPaint.setColor(parseHex(currentData.optString("active_color", "#00E5FF"), Color.CYAN));
         arcPaint.setStrokeCap(currentData.optBoolean("round_caps", true) ? Paint.Cap.ROUND : Paint.Cap.BUTT);
         canvas.drawArc(arcRect, 135, currentSweep, false, arcPaint);
 
-        // Czyste etykiety tekstowe (top, center, bottom)
         paint.setTextAlign(Paint.Align.CENTER);
 
         String top = currentData.optString("top_text", "");
@@ -162,7 +180,6 @@ public class DisplayRenderer {
         }
     }
 
-    // 3. SZKIELET KARUZELI (CAROUSEL)
     private void drawCarouselSkeleton() {
         paint.setTextAlign(Paint.Align.CENTER);
 
@@ -199,7 +216,6 @@ public class DisplayRenderer {
         }
     }
 
-    // 4. SZKIELET POSTĘPU (PROGRESS)
     private void drawProgressSkeleton() {
         paint.setTextAlign(Paint.Align.CENTER);
 
@@ -237,29 +253,23 @@ public class DisplayRenderer {
     }
 
     private void drawCustomStatusBar() {
-        JSONObject status = currentData.optJSONObject("status_bar");
-        if (status != null) {
-            String left = status.optString("left_text", "");
-            if (!left.isEmpty()) {
-                paint.setTextAlign(Paint.Align.LEFT);
-                paint.setColor(parseHex(status.optString("left_color", "#FF1744"), Color.RED));
-                paint.setTextSize(status.optInt("left_size", 16));
-                paint.setTypeface(Typeface.DEFAULT_BOLD);
-                canvas.drawText(left, 20, 32, paint);
-            }
+        if (hasAlert) {
+            paint.setTextAlign(Paint.Align.LEFT);
+            paint.setColor(Color.parseColor("#FF1744"));
+            paint.setTextSize(16);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            canvas.drawText("● " + alertText, 20, 32, paint);
+        }
 
-            String right = status.optString("right_text", "");
-            if (!right.isEmpty()) {
-                paint.setTextAlign(Paint.Align.RIGHT);
-                paint.setColor(parseHex(status.optString("right_color", "#FF5252"), Color.RED));
-                paint.setTextSize(status.optInt("right_size", 15));
-                paint.setTypeface(Typeface.DEFAULT_BOLD);
-                canvas.drawText(right, 220, 32, paint);
-            }
+        if (hw.isMicMuted()) {
+            paint.setTextAlign(Paint.Align.RIGHT);
+            paint.setColor(Color.parseColor("#FF5252"));
+            paint.setTextSize(15);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            canvas.drawText("MIC OFF", 220, 32, paint);
         }
     }
 
-    // Bezpośredni zrzut do fb1 bez alokacji
     private void pushToHardware() {
         canvasBmp.getPixels(pixelsBuf, 0, 240, 0, 0, 240, 240);
         int idx = 0;
@@ -283,7 +293,4 @@ public class DisplayRenderer {
             return fallback;
         }
     }
-
-    public String getCurrentLayout() { return currentLayout; }
-    public JSONObject getCurrentData() { return currentData; }
 }

@@ -17,6 +17,10 @@ public class HardwareManager {
     private OutputStream fbOutputStream;
     private OutputStream uartOutputStream;
 
+    public synchronized void writeUart(String payload) {
+        runRoot("echo -e -n '" + payload + "' > /dev/ttyAS4");
+    }
+
     public interface InputCallback {
         void onRotate(int delta);
         void onClick();
