@@ -60,6 +60,7 @@ public class BridgeService extends Service {
     private MqttClient client;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean running = true;
+    private boolean isConnecting = false;
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
@@ -76,7 +77,7 @@ public class BridgeService extends Service {
     private String alertBadgeText = "";
     private boolean isAlertKeepingAwake = false;
 
-    // Tryby pracy ekranu
+    // Tryby pracy
     private enum ScreenMode { CLOCK, GAUGE, MENU, MEDIA, ALERT }
     private ScreenMode currentMode = ScreenMode.CLOCK;
 
@@ -104,7 +105,7 @@ public class BridgeService extends Service {
     private String mediaSub = "";
     private int mediaProgress = -1;
 
-    // Synchronizacja z głównym ekranem tabletu
+    // Rejestrator wygaszania tabletu
     private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -135,9 +136,8 @@ public class BridgeService extends Service {
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         initMicMonitoring();
 
-        // Nieblokujące zadania I/O i sprzętowe
         new Thread(() -> {
-            initUartHardware();
+            initHardwarePermissions();
             setHardwarePower(true);
             drawClock();
         }).start();
@@ -149,7 +149,7 @@ public class BridgeService extends Service {
         registerReceiver(screenStateReceiver, filter);
 
         startRootInputMonitoring();
-        initMqtt();
+        startMqttLoop();
     }
 
     private void acquireLocks() {
@@ -164,9 +164,9 @@ public class BridgeService extends Service {
                 wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KnobBridge::WifiLock");
                 wifiLock.acquire();
             }
-            Log.i(TAG, "WakeLock i WifiLock zapięte pomyślnie");
+            Log.i(TAG, "WakeLock i WifiLock aktywne");
         } catch (Exception e) {
-            Log.e(TAG, "Błąd blokad zasilania", e);
+            Log.e(TAG, "Blad blokad", e);
         }
     }
 
@@ -180,12 +180,13 @@ public class BridgeService extends Service {
         startForeground(101, noti);
     }
 
-    // --- MAGISTRALA DSP AUDIO (/dev/ttyAS4) ---
-    private void initUartHardware() {
-        runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && chmod 666 /dev/ttyAS4");
-        Log.i(TAG, "Magistrala UART /dev/ttyAS4 zainicjalizowana");
+    // Nadanie uprawnień do plików urządzeń raz na zawsze przy starcie
+    private void initHardwarePermissions() {
+        runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && chmod 666 /dev/ttyAS4 && chmod 666 /dev/graphics/fb1");
+        Log.i(TAG, "Porty /dev/ttyAS4 oraz /dev/graphics/fb1 zainicjalizowane");
     }
 
+    // Bezpieczne wysyłanie ramki DSP bez blokowania procesu
     private void sendDspFrame(int cmd, int val, int room) {
         new Thread(() -> {
             byte[] frame = new byte[6];
@@ -198,34 +199,22 @@ public class BridgeService extends Service {
 
             try {
                 File f = new File("/dev/ttyAS4");
-                if (f.canWrite()) {
-                    FileOutputStream fos = new FileOutputStream(f);
-                    fos.write(frame);
-                    fos.flush();
-                    fos.close();
-                } else {
-                    Process p = Runtime.getRuntime().exec(new String[]{"su", "0"});
-                    OutputStream os = p.getOutputStream();
-                    os.write("cat > /dev/ttyAS4\n".getBytes());
-                    os.flush();
-                    os.write(frame);
-                    os.flush();
-                    os.close();
-                    p.waitFor();
-                }
+                FileOutputStream fos = new FileOutputStream(f);
+                fos.write(frame);
+                fos.flush();
+                fos.close();
             } catch (Exception e) {
-                Log.e(TAG, "DSP write error", e);
+                // Jesli brak uprawnien, wyslij przez printf (nie zawiesza sie tak jak cat)
+                String hexCmd = String.format(Locale.US, "printf '\\xFA\\x01\\x%02X\\x%02X\\x%02X\\x%02X' > /dev/ttyAS4",
+                        cmd & 0xFF, val & 0xFF, room & 0xFF, frame[5] & 0xFF);
+                runRootCmdSync(hexCmd);
             }
         }).start();
     }
 
-    // --- MONITORING I KONTROLA MIKROFONU ---
     private void initMicMonitoring() {
         if (audioManager != null) {
-            try {
-                isMicMuted = audioManager.isMicrophoneMute();
-            } catch (Exception ignored) {}
-
+            try { isMicMuted = audioManager.isMicrophoneMute(); } catch (Exception ignored) {}
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 try {
                     audioManager.registerAudioRecordingCallback(new AudioManager.AudioRecordingCallback() {
@@ -241,9 +230,7 @@ public class BridgeService extends Service {
                             }
                         }
                     }, handler);
-                } catch (Exception e) {
-                    Log.e(TAG, "Błąd rejestracji callbacku mikrofonu", e);
-                }
+                } catch (Exception ignored) {}
             }
         }
     }
@@ -254,20 +241,15 @@ public class BridgeService extends Service {
                 audioManager.setMicrophoneMute(mute);
                 isMicMuted = audioManager.isMicrophoneMute();
                 publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-                if (currentMode == ScreenMode.CLOCK) {
-                    drawClock();
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Błąd zmiany stanu mikrofonu", e);
-            }
+                if (currentMode == ScreenMode.CLOCK) drawClock();
+            } catch (Exception ignored) {}
         }
     }
 
-    // --- ZASILANIE EKRANU I LED ---
     private void setHardwarePower(boolean enable) {
         isScreenHardwarePowered = enable;
         new Thread(() -> {
-            runRootCmdSync(enable ? "echo on > /proc/vendor/lcd_ctrl && echo 0 > /sys/class/graphics/fb1/blank && chmod 666 /dev/graphics/fb1"
+            runRootCmdSync(enable ? "echo on > /proc/vendor/lcd_ctrl && echo 0 > /sys/class/graphics/fb1/blank"
                                   : "echo off > /proc/vendor/lcd_ctrl && echo 4 > /sys/class/graphics/fb1/blank");
             publishRaw(baseTopic + "/display/state", enable ? "on" : "off", true);
         }).start();
@@ -287,12 +269,9 @@ public class BridgeService extends Service {
             os.write((cmd + "\nexit\n").getBytes());
             os.flush();
             p.waitFor();
-        } catch (Exception e) {
-            Log.e(TAG, "Root cmd error: " + cmd, e);
-        }
+        } catch (Exception ignored) {}
     }
 
-    // --- CZYTANIE ENKODERA /dev/input/event0 ---
     private void startRootInputMonitoring() {
         new Thread(() -> {
             while (running) {
@@ -334,7 +313,6 @@ public class BridgeService extends Service {
                 publishRaw(baseTopic + "/knob/gauge_value", String.valueOf(gaugeValue), false);
                 resetTimeout(5000);
                 break;
-
             case MENU:
                 if (!menuItems.isEmpty()) {
                     menuIndex = (menuIndex + delta + menuItems.size()) % menuItems.size();
@@ -342,7 +320,6 @@ public class BridgeService extends Service {
                     resetTimeout(5000);
                 }
                 break;
-
             default:
                 break;
         }
@@ -433,60 +410,74 @@ public class BridgeService extends Service {
                 if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
                 ed.apply();
                 loadConfigAndRegisterReceiver();
-                initMqtt();
+                startMqttLoop();
             }
         }, filter, Context.RECEIVER_EXPORTED);
     }
 
-    private void initMqtt() {
+    // --- NIEZAWODNY KOROWÓD POŁĄCZENIA MQTT Z AUTOMATYCZNYM WZNAWIANIEM ---
+    private synchronized void startMqttLoop() {
+        if (isConnecting) return;
+        isConnecting = true;
+
         new Thread(() -> {
-            try {
-                if (client != null && client.isConnected()) client.disconnect();
-                client = new MqttClient(brokerUri, "PanelKnob_" + System.currentTimeMillis(), new MemoryPersistence());
-                MqttConnectOptions opts = new MqttConnectOptions();
-                opts.setCleanSession(true);
-                opts.setAutomaticReconnect(true);
-                opts.setKeepAliveInterval(30);
-                opts.setConnectionTimeout(30);
-                opts.setMaxInflight(50); // Przepustowość paczek discovery
-                if (!mqttUser.isEmpty()) {
-                    opts.setUserName(mqttUser);
-                    opts.setPassword(mqttPass.toCharArray());
-                }
-
-                client.setCallback(new MqttCallbackExtended() {
-                    @Override
-                    public void connectComplete(boolean reconnect, String serverURI) {
-                        Log.i(TAG, "MQTT connectComplete (reconnect=" + reconnect + ")");
-                        if (reconnect) {
-                            subscribeTopics();
-                            publishHomeAssistantDiscovery();
+            while (running) {
+                try {
+                    if (client == null || !client.isConnected()) {
+                        Log.i(TAG, "Próba połączenia z MQTT: " + brokerUri);
+                        if (client != null) {
+                            try { client.disconnectForcibly(); client.close(); } catch (Exception ignored) {}
                         }
+                        client = new MqttClient(brokerUri, "PanelKnob_" + System.currentTimeMillis(), new MemoryPersistence());
+                        MqttConnectOptions opts = new MqttConnectOptions();
+                        opts.setCleanSession(true);
+                        opts.setAutomaticReconnect(true);
+                        opts.setKeepAliveInterval(15);
+                        opts.setConnectionTimeout(10);
+                        opts.setMaxInflight(100);
+                        if (!mqttUser.isEmpty()) {
+                            opts.setUserName(mqttUser);
+                            opts.setPassword(mqttPass.toCharArray());
+                        }
+
+                        client.setCallback(new MqttCallbackExtended() {
+                            @Override
+                            public void connectComplete(boolean reconnect, String serverURI) {
+                                Log.i(TAG, "MQTT connectComplete (reconnect=" + reconnect + ")");
+                                subscribeTopics();
+                                publishHomeAssistantDiscovery();
+                            }
+
+                            @Override
+                            public void connectionLost(Throwable cause) {
+                                Log.w(TAG, "MQTT Connection lost! Wznowię automatycznie...");
+                                handler.postDelayed(() -> startMqttLoop(), 3000);
+                            }
+
+                            @Override
+                            public void messageArrived(String topic, MqttMessage message) {
+                                handleIncomingMqtt(topic, new String(message.getPayload()).trim());
+                            }
+
+                            @Override
+                            public void deliveryComplete(IMqttDeliveryToken token) {}
+                        });
+
+                        client.connect(opts);
+                        Log.i(TAG, "Połączono pomyślnie z brokerem!");
+                        subscribeTopics();
+                        publishHomeAssistantDiscovery();
+                        publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
+                        publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
+                        isConnecting = false;
+                        break;
                     }
-
-                    @Override
-                    public void connectionLost(Throwable cause) {
-                        Log.w(TAG, "MQTT Connection lost: " + (cause != null ? cause.getMessage() : "unknown"));
-                    }
-
-                    @Override
-                    public void messageArrived(String topic, MqttMessage message) {
-                        handleIncomingMqtt(topic, new String(message.getPayload()).trim());
-                    }
-
-                    @Override
-                    public void deliveryComplete(IMqttDeliveryToken token) {}
-                });
-
-                client.connect(opts);
-                Log.i(TAG, "Połączono pomyślnie! Rozpoczynam Discovery i subskrypcje...");
-                subscribeTopics();
-                publishHomeAssistantDiscovery();
-                publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-                publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
-            } catch (Exception e) {
-                Log.e(TAG, "MQTT Connect error: " + e.getMessage(), e);
+                } catch (Exception e) {
+                    Log.e(TAG, "Błąd łączenia z MQTT (" + e.getMessage() + "), kolejna próba za 5s...");
+                    try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
+                }
             }
+            isConnecting = false;
         }).start();
     }
 
@@ -499,9 +490,8 @@ public class BridgeService extends Service {
         } catch (Exception ignored) {}
     }
 
-    // --- REJESTRACJA W HA (Discovery z osobnymi blokami try-catch) ---
     private void publishHomeAssistantDiscovery() {
-        Log.i(TAG, "Rozpoczynam publikację Home Assistant Discovery...");
+        Log.i(TAG, "Wysyłanie Discovery...");
         try {
             JSONObject device = new JSONObject();
             device.put("identifiers", new JSONArray().put("panel_knob_engine_v4"));
@@ -509,126 +499,101 @@ public class BridgeService extends Service {
             device.put("model", "Allwinner DSP Knob 240x240");
             device.put("manufacturer", "Smart Home Lab");
 
-            // 1. Zdarzenie obrotu/kliku
-            try {
-                JSONObject ev = new JSONObject();
-                ev.put("name", "Zdarzenie Gałki");
-                ev.put("unique_id", "knob_event_trigger_v4");
-                ev.put("state_topic", baseTopic + "/knob/event");
-                ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
-                ev.put("device", device);
-                publishRaw("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd event discovery", e); }
+            // Event i sensory
+            JSONObject ev = new JSONObject();
+            ev.put("name", "Zdarzenie Gałki");
+            ev.put("unique_id", "knob_event_trigger_v4");
+            ev.put("state_topic", baseTopic + "/knob/event");
+            ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
+            ev.put("device", device);
+            publishRaw("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
 
-            // 2. Sensor akcji
-            try {
-                JSONObject act = new JSONObject();
-                act.put("name", "Akcja Gałki");
-                act.put("unique_id", "knob_action_sensor_v4");
-                act.put("state_topic", baseTopic + "/knob/action");
-                act.put("force_update", true);
-                act.put("icon", "mdi:rotate-right");
-                act.put("device", device);
-                publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd action sensor discovery", e); }
+            JSONObject act = new JSONObject();
+            act.put("name", "Akcja Gałki");
+            act.put("unique_id", "knob_action_sensor_v4");
+            act.put("state_topic", baseTopic + "/knob/action");
+            act.put("force_update", true);
+            act.put("icon", "mdi:rotate-right");
+            act.put("device", device);
+            publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
 
-            // 3. Sensor zatwierdzonej wartości
-            try {
-                JSONObject conf = new JSONObject();
-                conf.put("name", "Zatwierdzona Wartość");
-                conf.put("unique_id", "knob_confirm_val_v4");
-                conf.put("state_topic", baseTopic + "/knob/confirm");
-                conf.put("icon", "mdi:check-circle-outline");
-                conf.put("device", device);
-                publishRaw("homeassistant/sensor/panel_knob/confirm/config", conf.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd confirm sensor discovery", e); }
+            JSONObject conf = new JSONObject();
+            conf.put("name", "Zatwierdzona Wartość");
+            conf.put("unique_id", "knob_confirm_val_v4");
+            conf.put("state_topic", baseTopic + "/knob/confirm");
+            conf.put("icon", "mdi:check-circle-outline");
+            conf.put("device", device);
+            publishRaw("homeassistant/sensor/panel_knob/confirm/config", conf.toString(), true);
 
-            // 4. Przełącznik ekranu
-            try {
-                JSONObject pwr = new JSONObject();
-                pwr.put("name", "Zasilanie Ekraniku");
-                pwr.put("unique_id", "knob_power_switch_v4");
-                pwr.put("command_topic", baseTopic + "/display/power");
-                pwr.put("state_topic", baseTopic + "/display/state");
-                pwr.put("payload_on", "on");
-                pwr.put("payload_off", "off");
-                pwr.put("icon", "mdi:power");
-                pwr.put("device", device);
-                publishRaw("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd power switch discovery", e); }
+            JSONObject pwr = new JSONObject();
+            pwr.put("name", "Zasilanie Ekraniku");
+            pwr.put("unique_id", "knob_power_switch_v4");
+            pwr.put("command_topic", baseTopic + "/display/power");
+            pwr.put("state_topic", baseTopic + "/display/state");
+            pwr.put("payload_on", "on");
+            pwr.put("payload_off", "off");
+            pwr.put("icon", "mdi:power");
+            pwr.put("device", device);
+            publishRaw("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
 
-            // 5. Przełącznik LED
-            try {
-                JSONObject led = new JSONObject();
-                led.put("name", "Pierścień LED");
-                led.put("unique_id", "knob_led_ring_v4");
-                led.put("command_topic", baseTopic + "/led/set");
-                led.put("state_topic", baseTopic + "/led/state");
-                led.put("payload_on", "on");
-                led.put("payload_off", "off");
-                led.put("icon", "mdi:led-strip-variant");
-                led.put("device", device);
-                publishRaw("homeassistant/switch/panel_knob/led_ring/config", led.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd led switch discovery", e); }
+            JSONObject led = new JSONObject();
+            led.put("name", "Pierścień LED");
+            led.put("unique_id", "knob_led_ring_v4");
+            led.put("command_topic", baseTopic + "/led/set");
+            led.put("state_topic", baseTopic + "/led/state");
+            led.put("payload_on", "on");
+            led.put("payload_off", "off");
+            led.put("icon", "mdi:led-strip-variant");
+            led.put("device", device);
+            publishRaw("homeassistant/switch/panel_knob/led_ring/config", led.toString(), true);
 
-            // 6. Wyciszenie mikrofonu
-            try {
-                JSONObject micM = new JSONObject();
-                micM.put("name", "Wyciszenie Mikrofonu");
-                micM.put("unique_id", "knob_mic_mute_v4");
-                micM.put("command_topic", baseTopic + "/mic/mute/set");
-                micM.put("state_topic", baseTopic + "/mic/mute/state");
-                micM.put("payload_on", "ON");
-                micM.put("payload_off", "OFF");
-                micM.put("icon", "mdi:microphone-off");
-                micM.put("device", device);
-                publishRaw("homeassistant/switch/panel_knob/mic_mute/config", micM.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd mic mute discovery", e); }
+            JSONObject micM = new JSONObject();
+            micM.put("name", "Wyciszenie Mikrofonu");
+            micM.put("unique_id", "knob_mic_mute_v4");
+            micM.put("command_topic", baseTopic + "/mic/mute/set");
+            micM.put("state_topic", baseTopic + "/mic/mute/state");
+            micM.put("payload_on", "ON");
+            micM.put("payload_off", "OFF");
+            micM.put("icon", "mdi:microphone-off");
+            micM.put("device", device);
+            publishRaw("homeassistant/switch/panel_knob/mic_mute/config", micM.toString(), true);
 
-            // 7. Mikrofon aktywny
-            try {
-                JSONObject micA = new JSONObject();
-                micA.put("name", "Mikrofon Używany");
-                micA.put("unique_id", "knob_mic_active_v4");
-                micA.put("state_topic", baseTopic + "/mic/active/state");
-                micA.put("payload_on", "ON");
-                micA.put("payload_off", "OFF");
-                micA.put("icon", "mdi:microphone");
-                micA.put("device", device);
-                publishRaw("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd mic active discovery", e); }
+            JSONObject micA = new JSONObject();
+            micA.put("name", "Mikrofon Używany");
+            micA.put("unique_id", "knob_mic_active_v4");
+            micA.put("state_topic", baseTopic + "/mic/active/state");
+            micA.put("payload_on", "ON");
+            micA.put("payload_off", "OFF");
+            micA.put("icon", "mdi:microphone");
+            micA.put("device", device);
+            publishRaw("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
 
-            // 8. Strefa 1 DSP (Master, L, P)
+            // Strefa 1 (Master, L, P)
             registerNumberEntity("dsp_z1_master", "Strefa 1 Głośność Główna", baseTopic + "/dsp/z1/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z1_left", "Strefa 1 Głośnik Lewy", baseTopic + "/dsp/z1/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z1_right", "Strefa 1 Głośnik Prawy", baseTopic + "/dsp/z1/right", 0, 20, "mdi:speaker", device);
 
-            // 9. Strefa 2 DSP (Master, L, P)
+            // Strefa 2 (Master, L, P)
             registerNumberEntity("dsp_z2_master", "Strefa 2 Głośność Główna", baseTopic + "/dsp/z2/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z2_left", "Strefa 2 Głośnik Lewy", baseTopic + "/dsp/z2/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z2_right", "Strefa 2 Głośnik Prawy", baseTopic + "/dsp/z2/right", 0, 20, "mdi:speaker", device);
 
-            // 10. Equalizer EQ (Basy, Soprany)
+            // Equalizer
             registerNumberEntity("dsp_eq_bass", "Korektor Basy", baseTopic + "/dsp/eq/bass", -10, 10, "mdi:equalizer", device);
             registerNumberEntity("dsp_eq_treble", "Korektor Soprany", baseTopic + "/dsp/eq/treble", -10, 10, "mdi:equalizer", device);
 
-            // 11. Profil EQ
-            try {
-                JSONObject eqProf = new JSONObject();
-                eqProf.put("name", "Profil Dźwięku EQ");
-                eqProf.put("unique_id", "knob_dsp_eq_mode_v4");
-                eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
-                eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
-                eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
-                eqProf.put("icon", "mdi:music-box-outline");
-                eqProf.put("device", device);
-                publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Błąd eq select discovery", e); }
+            JSONObject eqProf = new JSONObject();
+            eqProf.put("name", "Profil Dźwięku EQ");
+            eqProf.put("unique_id", "knob_dsp_eq_mode_v4");
+            eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
+            eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
+            eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
+            eqProf.put("icon", "mdi:music-box-outline");
+            eqProf.put("device", device);
+            publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
 
-            Log.i(TAG, "Wszystkie encje MQTT Discovery wysłane pomyślnie!");
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd główny discovery", e);
-        }
+            Log.i(TAG, "Discovery wysłane pomyślnie");
+        } catch (Exception ignored) {}
     }
 
     private void registerNumberEntity(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) {
@@ -644,15 +609,14 @@ public class BridgeService extends Service {
             obj.put("icon", icon);
             obj.put("device", device);
             publishRaw("homeassistant/number/panel_knob/" + id + "/config", obj.toString(), true);
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd rejestracji encji number: " + id, e);
-        }
+        } catch (Exception ignored) {}
     }
 
-    // --- OBSŁUGA ROZKAZÓW MQTT ---
+    // --- OBSŁUGA ROZKAZÓW Z HOME ASSISTANT ---
     private void handleIncomingMqtt(String topic, String payload) {
         try {
-            // Kontrola mikrofonu
+            Log.d(TAG, "Odebrano MQTT: " + topic + " -> " + payload);
+
             if (topic.equals(baseTopic + "/mic/mute/set")) {
                 setMicrophoneMute("ON".equalsIgnoreCase(payload) || "true".equalsIgnoreCase(payload));
                 return;
@@ -698,10 +662,10 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // DSP Equalizer
+            // DSP EQ
             if (topic.equals(baseTopic + "/dsp/eq/bass/set")) {
-                int db = Integer.parseInt(payload); // -10 do +10
-                int hex = 0xA0 + db; // 0x96 do 0xAA
+                int db = Integer.parseInt(payload);
+                int hex = 0xA0 + db;
                 sendDspFrame(0xAB, hex, 1);
                 sendDspFrame(0xAB, hex, 2);
                 publishRaw(baseTopic + "/dsp/eq/bass/state", String.valueOf(db), true);
@@ -731,7 +695,6 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // Zasilanie ekranu / LED
             if (topic.equals(baseTopic + "/display/power")) {
                 setHardwarePower("on".equalsIgnoreCase(payload));
                 if (isScreenHardwarePowered) redrawCurrentScreen();
@@ -742,7 +705,6 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // Czyszczenie alertu z HA
             if (topic.equals(baseTopic + "/display/alert/clear")) {
                 hasUnreadAlert = false;
                 alertBadgeText = "";
@@ -752,7 +714,6 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // GAUGE
             if (topic.equals(baseTopic + "/display/gauge")) {
                 JSONObject j = new JSONObject(payload);
                 gaugeTitle = j.optString("title", "");
@@ -771,7 +732,6 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // MENU
             if (topic.equals(baseTopic + "/display/menu")) {
                 JSONObject j = new JSONObject(payload);
                 menuTitle = j.optString("title", "");
@@ -790,7 +750,6 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // MEDIA
             if (topic.equals(baseTopic + "/display/media")) {
                 JSONObject j = new JSONObject(payload);
                 mediaHeader = j.optString("header", "");
@@ -805,7 +764,6 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // ALERT
             if (topic.equals(baseTopic + "/display/alert")) {
                 JSONObject j = new JSONObject(payload);
                 String title = j.optString("title", "");
@@ -835,7 +793,7 @@ public class BridgeService extends Service {
             }
 
         } catch (Exception e) {
-            Log.e(TAG, "MQTT parse error", e);
+            Log.e(TAG, "Błąd parsowania MQTT", e);
         }
     }
 
@@ -873,8 +831,6 @@ public class BridgeService extends Service {
     }
 
     // --- RYSOWANIE GRAFIKI ---
-
-    // 1. ZEGAR
     private synchronized void drawClock() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -915,7 +871,6 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
-    // 2. GAUGE
     private synchronized void drawGaugeScreen() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -977,7 +932,6 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
-    // 3. MENU
     private synchronized void drawMenuScreen() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -1013,14 +967,13 @@ public class BridgeService extends Service {
         if (!menuFooter.isEmpty()) {
             p.setColor(Color.GRAY);
             p.setTextSize(16);
-            p.setTypeface(Typeface.DEFAULT);
+            tp.setTypeface(Typeface.DEFAULT);
             canvas.drawText(menuFooter, 120, 195, p);
         }
 
         renderToFramebuffer(bmp);
     }
 
-    // 4. MEDIA
     private synchronized void drawMediaScreen(String base64Img) {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -1075,7 +1028,6 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
-    // 5. ALERT
     private synchronized void drawAlertScreen(String title, String msg, String footer, String colorHex) {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -1107,7 +1059,6 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
-    // Kluczowa poprawka: QoS 0 zapobiega blokowaniu socketu TCP
     private void publishRaw(String topic, String payload, boolean retained) {
         try {
             if (client != null && client.isConnected()) {
@@ -1116,11 +1067,10 @@ public class BridgeService extends Service {
                 msg.setRetained(retained);
                 client.publish(topic, msg);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd publikacji na: " + topic, e);
-        }
+        } catch (Exception ignored) {}
     }
 
+    // Bezpieczny zapis do bufora fb1 (bez blokowania su procesu)
     private synchronized void renderToFramebuffer(Bitmap bmp) {
         if (!isScreenHardwarePowered) return;
         try {
@@ -1140,24 +1090,11 @@ public class BridgeService extends Service {
             }
 
             File fb = new File("/dev/graphics/fb1");
-            if (fb.canWrite()) {
-                FileOutputStream fos = new FileOutputStream(fb);
-                fos.write(raw);
-                fos.flush();
-                fos.close();
-            } else {
-                Process process = Runtime.getRuntime().exec(new String[]{"su", "0"});
-                OutputStream os = process.getOutputStream();
-                os.write(("cat > /dev/graphics/fb1\n").getBytes());
-                os.flush();
-                os.write(raw);
-                os.flush();
-                os.close();
-                process.waitFor();
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Framebuffer error", e);
-        }
+            FileOutputStream fos = new FileOutputStream(fb);
+            fos.write(raw);
+            fos.flush();
+            fos.close();
+        } catch (Exception ignored) {}
     }
 
     @Override
