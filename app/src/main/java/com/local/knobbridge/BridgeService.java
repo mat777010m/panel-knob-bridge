@@ -135,7 +135,7 @@ public class BridgeService extends Service {
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         initMicMonitoring();
 
-        // Wszystkie operacje blokujące I/O odpalamy w osobnym wątku (nie zamraża startu!)
+        // Nieblokujące zadania I/O i sprzętowe
         new Thread(() -> {
             initUartHardware();
             setHardwarePower(true);
@@ -263,7 +263,7 @@ public class BridgeService extends Service {
         }
     }
 
-    // --- ZASILANIE EKRANU I LED (Asynchroniczne, nie blokuje wątku) ---
+    // --- ZASILANIE EKRANU I LED ---
     private void setHardwarePower(boolean enable) {
         isScreenHardwarePowered = enable;
         new Thread(() -> {
@@ -446,8 +446,9 @@ public class BridgeService extends Service {
                 MqttConnectOptions opts = new MqttConnectOptions();
                 opts.setCleanSession(true);
                 opts.setAutomaticReconnect(true);
-                opts.setKeepAliveInterval(20);
-                opts.setConnectionTimeout(10);
+                opts.setKeepAliveInterval(30);
+                opts.setConnectionTimeout(30);
+                opts.setMaxInflight(50); // Przepustowość paczek discovery
                 if (!mqttUser.isEmpty()) {
                     opts.setUserName(mqttUser);
                     opts.setPassword(mqttPass.toCharArray());
@@ -456,11 +457,11 @@ public class BridgeService extends Service {
                 client.setCallback(new MqttCallbackExtended() {
                     @Override
                     public void connectComplete(boolean reconnect, String serverURI) {
-                        Log.i(TAG, "MQTT Connected to " + serverURI);
-                        subscribeTopics();
-                        publishHomeAssistantDiscovery();
-                        publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-                        publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
+                        Log.i(TAG, "MQTT connectComplete (reconnect=" + reconnect + ")");
+                        if (reconnect) {
+                            subscribeTopics();
+                            publishHomeAssistantDiscovery();
+                        }
                     }
 
                     @Override
@@ -478,8 +479,13 @@ public class BridgeService extends Service {
                 });
 
                 client.connect(opts);
+                Log.i(TAG, "Połączono pomyślnie! Rozpoczynam Discovery i subskrypcje...");
+                subscribeTopics();
+                publishHomeAssistantDiscovery();
+                publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
+                publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
             } catch (Exception e) {
-                Log.e(TAG, "MQTT Connect error: " + e.getMessage());
+                Log.e(TAG, "MQTT Connect error: " + e.getMessage(), e);
             }
         }).start();
     }
@@ -493,7 +499,7 @@ public class BridgeService extends Service {
         } catch (Exception ignored) {}
     }
 
-    // --- REJESTRACJA W HA (Kuloodporne Auto-Discovery z logowaniem) ---
+    // --- REJESTRACJA W HA (Discovery z osobnymi blokami try-catch) ---
     private void publishHomeAssistantDiscovery() {
         Log.i(TAG, "Rozpoczynam publikację Home Assistant Discovery...");
         try {
@@ -736,7 +742,7 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // Czyszczenie alertu z poziomu HA
+            // Czyszczenie alertu z HA
             if (topic.equals(baseTopic + "/display/alert/clear")) {
                 hasUnreadAlert = false;
                 alertBadgeText = "";
@@ -784,7 +790,7 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // MEDIA (Brak sztywnego "NOW PLAYING")
+            // MEDIA
             if (topic.equals(baseTopic + "/display/media")) {
                 JSONObject j = new JSONObject(payload);
                 mediaHeader = j.optString("header", "");
@@ -799,7 +805,7 @@ public class BridgeService extends Service {
                 return;
             }
 
-            // ALERT (Brak sztywnego "ALARM" i stopki)
+            // ALERT
             if (topic.equals(baseTopic + "/display/alert")) {
                 JSONObject j = new JSONObject(payload);
                 String title = j.optString("title", "");
@@ -845,7 +851,6 @@ public class BridgeService extends Service {
         else drawClock();
     }
 
-    // Bezpieczna animacja łuku w pętli głównej Main Looper
     private void animateGaugeToValue(int targetVal) {
         handler.post(() -> {
             float range = Math.max(1, gaugeMax - gaugeMin);
@@ -869,7 +874,7 @@ public class BridgeService extends Service {
 
     // --- RYSOWANIE GRAFIKI ---
 
-    // 1. ZEGAR (Ze statusem mikrofonu i alertu)
+    // 1. ZEGAR
     private synchronized void drawClock() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -880,12 +885,12 @@ public class BridgeService extends Service {
         p.setTextAlign(Paint.Align.CENTER);
 
         if (isMicMuted) {
-            p.setColor(Color.parseColor("#FFA000")); // Bursztyn
+            p.setColor(Color.parseColor("#FFA000"));
             p.setTextSize(16);
             p.setTypeface(Typeface.DEFAULT_BOLD);
             canvas.drawText("MIC: WYCISZONY", 120, 38, p);
         } else if (isMicActive) {
-            p.setColor(Color.parseColor("#FF1744")); // Czerwony
+            p.setColor(Color.parseColor("#FF1744"));
             p.setTextSize(16);
             p.setTypeface(Typeface.DEFAULT_BOLD);
             canvas.drawText("● MIC AKTYWNY", 120, 38, p);
@@ -1102,14 +1107,18 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
+    // Kluczowa poprawka: QoS 0 zapobiega blokowaniu socketu TCP
     private void publishRaw(String topic, String payload, boolean retained) {
         try {
             if (client != null && client.isConnected()) {
                 MqttMessage msg = new MqttMessage(payload.getBytes());
+                msg.setQos(0);
                 msg.setRetained(retained);
                 client.publish(topic, msg);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd publikacji na: " + topic, e);
+        }
     }
 
     private synchronized void renderToFramebuffer(Bitmap bmp) {
