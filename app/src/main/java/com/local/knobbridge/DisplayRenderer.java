@@ -12,7 +12,7 @@ public class DisplayRenderer {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final HardwareManager hw;
 
-    // Stałe bufory pamięci - ZERO alokacji podczas animacji/rysowania
+    // Stałe bufory pamięci - zero alokacji podczas renderowania
     private final Bitmap canvasBmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
     private final Canvas canvas = new Canvas(canvasBmp);
     private final int[] pixelsBuf = new int[240 * 240];
@@ -52,14 +52,21 @@ public class DisplayRenderer {
         render();
     }
 
-    // Aliasy dla zgodności z resztą klas
     public synchronized void setTemplate(String tpl, JSONObject data) {
         setLayout(tpl, data);
     }
 
-    public String getCurrentLayout() { return currentLayout; }
-    public String getCurrentTemplate() { return currentLayout; }
-    public JSONObject getCurrentData() { return currentData; }
+    public String getCurrentLayout() {
+        return currentLayout;
+    }
+
+    public String getCurrentTemplate() {
+        return currentLayout;
+    }
+
+    public JSONObject getCurrentData() {
+        return currentData;
+    }
 
     public synchronized void setAlert(boolean active, String text) {
         this.hasAlert = active;

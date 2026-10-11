@@ -26,7 +26,6 @@ public class RuleEngine {
         this.mqtt = mqtt;
     }
 
-    // Wykonywanie reguł dla MQTT
     public void processMqtt(String topic, String payload) {
         try {
             JSONArray rules = configMgr.getConfig().optJSONArray("rules");
@@ -70,13 +69,12 @@ public class RuleEngine {
         }
     }
 
-    // Obsługa gałki: zmiana wartości i 5s timeout
     private final Runnable timeoutCancelTask = () -> {
-        String tpl = renderer.getCurrentTemplate();
-        if ("dial".equals(tpl) || "menu".equals(tpl)) {
-            if (mqtt != null) mqtt.publish("panel/knob/cancel", "{\"template\":\"" + tpl + "\"}", false);
+        String tpl = renderer.getCurrentLayout();
+        if ("dial".equals(tpl) || "menu".equals(tpl) || "carousel".equals(tpl)) {
+            if (mqtt != null) mqtt.publish("panel/knob/cancel", "{\"layout\":\"" + tpl + "\"}", false);
         }
-        renderer.setTemplate("clock", new JSONObject());
+        renderer.setLayout("clock", new JSONObject());
     };
 
     public void onKnobTurn(int delta) {
@@ -88,7 +86,7 @@ public class RuleEngine {
 
         if (mqtt != null) mqtt.publish("panel/knob/action", delta > 0 ? "rotate_right" : "rotate_left", false);
 
-        String tpl = renderer.getCurrentTemplate();
+        String tpl = renderer.getCurrentLayout();
         JSONObject data = renderer.getCurrentData();
 
         if ("dial".equals(tpl)) {
@@ -103,7 +101,7 @@ public class RuleEngine {
             renderer.animateDial(val, min, max);
             if (mqtt != null) mqtt.publish("panel/knob/value", String.valueOf(val), false);
             resetTimeout(5000);
-        } else if ("menu".equals(tpl)) {
+        } else if ("menu".equals(tpl) || "carousel".equals(tpl)) {
             JSONArray arr = data.optJSONArray("items");
             if (arr != null && arr.length() > 0) {
                 int idx = data.optInt("selected_index", 0);
@@ -124,22 +122,22 @@ public class RuleEngine {
 
         if (mqtt != null) mqtt.publish("panel/knob/action", "click", false);
 
-        String tpl = renderer.getCurrentTemplate();
+        String tpl = renderer.getCurrentLayout();
         JSONObject data = renderer.getCurrentData();
 
         if ("dial".equals(tpl)) {
             if (mqtt != null) mqtt.publish("panel/knob/confirm", String.valueOf(data.optInt("value", 0)), false);
-            renderer.setTemplate("clock", new JSONObject());
-        } else if ("menu".equals(tpl)) {
+            renderer.setLayout("clock", new JSONObject());
+        } else if ("menu".equals(tpl) || "carousel".equals(tpl)) {
             JSONArray arr = data.optJSONArray("items");
             int idx = data.optInt("selected_index", 0);
             if (arr != null && idx < arr.length()) {
                 if (mqtt != null) mqtt.publish("panel/knob/menu_select", arr.optString(idx, ""), false);
             }
-            renderer.setTemplate("clock", new JSONObject());
+            renderer.setLayout("clock", new JSONObject());
         } else if ("alert".equals(tpl)) {
             renderer.setAlert(false, "");
-            renderer.setTemplate("clock", new JSONObject());
+            renderer.setLayout("clock", new JSONObject());
         }
     }
 

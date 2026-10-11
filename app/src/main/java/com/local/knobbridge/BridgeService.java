@@ -33,7 +33,7 @@ public class BridgeService extends Service {
                 hardwareMgr.setScreenPower(true);
                 renderer.render();
             } else if (Intent.ACTION_TIME_TICK.equals(act)) {
-                if ("clock".equals(renderer.getCurrentTemplate()) && hardwareMgr.isScreenPowered()) {
+                if ("clock".equals(renderer.getCurrentLayout()) && hardwareMgr.isScreenPowered()) {
                     renderer.render();
                 }
             }
