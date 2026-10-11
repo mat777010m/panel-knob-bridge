@@ -61,6 +61,8 @@ public class BridgeService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean running = true;
     private boolean isConnecting = false;
+    private final Object mqttLock = new Object();
+    private boolean isDiscoveryInProgress = false;
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
@@ -77,7 +79,7 @@ public class BridgeService extends Service {
     private String alertBadgeText = "";
     private boolean isAlertKeepingAwake = false;
 
-    // Tryby pracy
+    // Tryby pracy ekranu
     private enum ScreenMode { CLOCK, GAUGE, MENU, MEDIA, ALERT }
     private ScreenMode currentMode = ScreenMode.CLOCK;
 
@@ -105,7 +107,7 @@ public class BridgeService extends Service {
     private String mediaSub = "";
     private int mediaProgress = -1;
 
-    // Rejestrator wygaszania tabletu
+    // Synchronizacja z głównym ekranem tabletu
     private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -180,13 +182,11 @@ public class BridgeService extends Service {
         startForeground(101, noti);
     }
 
-    // Nadanie uprawnień do plików urządzeń raz na zawsze przy starcie
     private void initHardwarePermissions() {
         runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && chmod 666 /dev/ttyAS4 && chmod 666 /dev/graphics/fb1");
         Log.i(TAG, "Porty /dev/ttyAS4 oraz /dev/graphics/fb1 zainicjalizowane");
     }
 
-    // Bezpieczne wysyłanie ramki DSP bez blokowania procesu
     private void sendDspFrame(int cmd, int val, int room) {
         new Thread(() -> {
             byte[] frame = new byte[6];
@@ -204,7 +204,6 @@ public class BridgeService extends Service {
                 fos.flush();
                 fos.close();
             } catch (Exception e) {
-                // Jesli brak uprawnien, wyslij przez printf (nie zawiesza sie tak jak cat)
                 String hexCmd = String.format(Locale.US, "printf '\\xFA\\x01\\x%02X\\x%02X\\x%02X\\x%02X' > /dev/ttyAS4",
                         cmd & 0xFF, val & 0xFF, room & 0xFF, frame[5] & 0xFF);
                 runRootCmdSync(hexCmd);
@@ -415,83 +414,103 @@ public class BridgeService extends Service {
         }, filter, Context.RECEIVER_EXPORTED);
     }
 
-    // --- NIEZAWODNY KOROWÓD POŁĄCZENIA MQTT Z AUTOMATYCZNYM WZNAWIANIEM ---
     private synchronized void startMqttLoop() {
         if (isConnecting) return;
         isConnecting = true;
 
         new Thread(() -> {
-            while (running) {
-                try {
-                    if (client == null || !client.isConnected()) {
-                        Log.i(TAG, "Próba połączenia z MQTT: " + brokerUri);
-                        if (client != null) {
-                            try { client.disconnectForcibly(); client.close(); } catch (Exception ignored) {}
-                        }
-                        client = new MqttClient(brokerUri, "PanelKnob_" + System.currentTimeMillis(), new MemoryPersistence());
-                        MqttConnectOptions opts = new MqttConnectOptions();
-                        opts.setCleanSession(true);
-                        opts.setAutomaticReconnect(true);
-                        opts.setKeepAliveInterval(15);
-                        opts.setConnectionTimeout(10);
-                        opts.setMaxInflight(100);
-                        if (!mqttUser.isEmpty()) {
-                            opts.setUserName(mqttUser);
-                            opts.setPassword(mqttPass.toCharArray());
-                        }
+            try {
+                if (client != null && client.isConnected()) {
+                    isConnecting = false;
+                    return;
+                }
 
-                        client.setCallback(new MqttCallbackExtended() {
-                            @Override
-                            public void connectComplete(boolean reconnect, String serverURI) {
-                                Log.i(TAG, "MQTT connectComplete (reconnect=" + reconnect + ")");
+                Log.i(TAG, "Łączenie z brokerem MQTT: " + brokerUri);
+                client = new MqttClient(brokerUri, "PanelKnobEngine_" + System.currentTimeMillis(), new MemoryPersistence());
+                MqttConnectOptions opts = new MqttConnectOptions();
+                opts.setCleanSession(true);
+                opts.setAutomaticReconnect(true);
+                opts.setKeepAliveInterval(20);
+                opts.setConnectionTimeout(15);
+                opts.setMaxInflight(100);
+                if (!mqttUser.isEmpty()) {
+                    opts.setUserName(mqttUser);
+                    opts.setPassword(mqttPass.toCharArray());
+                }
+
+                client.setCallback(new MqttCallbackExtended() {
+                    @Override
+                    public void connectComplete(boolean reconnect, String serverURI) {
+                        Log.i(TAG, "MQTT połączone (reconnect=" + reconnect + "). Rejestruję encje...");
+                        new Thread(() -> {
+                            synchronized (mqttLock) {
                                 subscribeTopics();
                                 publishHomeAssistantDiscovery();
+                                publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
+                                publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
                             }
-
-                            @Override
-                            public void connectionLost(Throwable cause) {
-                                Log.w(TAG, "MQTT Connection lost! Wznowię automatycznie...");
-                                handler.postDelayed(() -> startMqttLoop(), 3000);
-                            }
-
-                            @Override
-                            public void messageArrived(String topic, MqttMessage message) {
-                                handleIncomingMqtt(topic, new String(message.getPayload()).trim());
-                            }
-
-                            @Override
-                            public void deliveryComplete(IMqttDeliveryToken token) {}
-                        });
-
-                        client.connect(opts);
-                        Log.i(TAG, "Połączono pomyślnie z brokerem!");
-                        subscribeTopics();
-                        publishHomeAssistantDiscovery();
-                        publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-                        publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
-                        isConnecting = false;
-                        break;
+                        }).start();
                     }
-                } catch (Exception e) {
-                    Log.e(TAG, "Błąd łączenia z MQTT (" + e.getMessage() + "), kolejna próba za 5s...");
-                    try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
-                }
+
+                    @Override
+                    public void connectionLost(Throwable cause) {
+                        Log.w(TAG, "MQTT utracone: " + (cause != null ? cause.getMessage() : "unknown"));
+                        handler.postDelayed(() -> startMqttLoop(), 4000);
+                    }
+
+                    @Override
+                    public void messageArrived(String topic, MqttMessage message) {
+                        handleIncomingMqtt(topic, new String(message.getPayload()).trim());
+                    }
+
+                    @Override
+                    public void deliveryComplete(IMqttDeliveryToken token) {}
+                });
+
+                client.connect(opts);
+            } catch (Exception e) {
+                Log.e(TAG, "Błąd łączenia z MQTT (" + e.getMessage() + "), ponawiam za 5s...");
+                handler.postDelayed(() -> startMqttLoop(), 5000);
+            } finally {
+                isConnecting = false;
             }
-            isConnecting = false;
         }).start();
     }
 
     private void subscribeTopics() {
         try {
-            client.subscribe(baseTopic + "/display/#");
-            client.subscribe(baseTopic + "/led/#");
-            client.subscribe(baseTopic + "/dsp/#");
-            client.subscribe(baseTopic + "/mic/#");
-        } catch (Exception ignored) {}
+            if (client != null && client.isConnected()) {
+                client.subscribe(new String[]{
+                        baseTopic + "/display/#",
+                        baseTopic + "/led/#",
+                        baseTopic + "/dsp/#",
+                        baseTopic + "/mic/#"
+                }, new int[]{0, 0, 0, 0});
+                Log.i(TAG, "Pomyślnie zasubskrybowano tematy panelu");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd subskrypcji", e);
+        }
+    }
+
+    private void publishRaw(String topic, String payload, boolean retained) {
+        try {
+            if (client != null && client.isConnected()) {
+                MqttMessage msg = new MqttMessage(payload.getBytes());
+                msg.setQos(retained ? 1 : 0);
+                msg.setRetained(retained);
+                client.publish(topic, msg);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd wysyłania na " + topic + ": " + e.getMessage());
+        }
     }
 
     private void publishHomeAssistantDiscovery() {
+        if (isDiscoveryInProgress) return;
+        isDiscoveryInProgress = true;
         Log.i(TAG, "Wysyłanie Discovery...");
+
         try {
             JSONObject device = new JSONObject();
             device.put("identifiers", new JSONArray().put("panel_knob_engine_v4"));
@@ -593,7 +612,9 @@ public class BridgeService extends Service {
             publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
 
             Log.i(TAG, "Discovery wysłane pomyślnie");
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {} finally {
+            isDiscoveryInProgress = false;
+        }
     }
 
     private void registerNumberEntity(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) {
@@ -612,7 +633,6 @@ public class BridgeService extends Service {
         } catch (Exception ignored) {}
     }
 
-    // --- OBSŁUGA ROZKAZÓW Z HOME ASSISTANT ---
     private void handleIncomingMqtt(String topic, String payload) {
         try {
             Log.d(TAG, "Odebrano MQTT: " + topic + " -> " + payload);
@@ -830,7 +850,6 @@ public class BridgeService extends Service {
         });
     }
 
-    // --- RYSOWANIE GRAFIKI ---
     private synchronized void drawClock() {
         Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
         Canvas canvas = new Canvas(bmp);
@@ -1059,18 +1078,6 @@ public class BridgeService extends Service {
         renderToFramebuffer(bmp);
     }
 
-    private void publishRaw(String topic, String payload, boolean retained) {
-        try {
-            if (client != null && client.isConnected()) {
-                MqttMessage msg = new MqttMessage(payload.getBytes());
-                msg.setQos(0);
-                msg.setRetained(retained);
-                client.publish(topic, msg);
-            }
-        } catch (Exception ignored) {}
-    }
-
-    // Bezpieczny zapis do bufora fb1 (bez blokowania su procesu)
     private synchronized void renderToFramebuffer(Bitmap bmp) {
         if (!isScreenHardwarePowered) return;
         try {
