@@ -12,6 +12,7 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <application
+        android:name=".App"
         android:label="Knob Bridge"
         android:persistent="true">
 
