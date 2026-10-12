@@ -95,10 +95,13 @@ public class BridgeService extends Service {
 
     // Wskaźnik interakcji z gałką na ekranie
     private String lastKnobFeedback = "";
-    private final Runnable clearFeedbackTask = () -> {
-        lastKnobFeedback = "";
-        if (currentMode == ScreenMode.CLOCK && isScreenHardwarePowered) {
-            postRenderTask(this::drawClockInternal);
+    private final Runnable clearFeedbackTask = new Runnable() {
+        @Override
+        public void run() {
+            lastKnobFeedback = "";
+            if (currentMode == ScreenMode.CLOCK && isScreenHardwarePowered) {
+                postRenderTask(BridgeService.this::drawClockInternal);
+            }
         }
     };
 
