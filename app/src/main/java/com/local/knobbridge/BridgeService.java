@@ -10,11 +10,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.media.AudioManager;
@@ -43,15 +45,20 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BridgeService extends Service {
     private static final String TAG = "KnobBridge";
 
+    // Konfiguracja MQTT
     private String brokerUri = "tcp://192.168.0.7:1883";
     private String mqttUser = "admin";
     private String mqttPass = "admin";
@@ -59,14 +66,22 @@ public class BridgeService extends Service {
 
     private MqttClient client;
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private boolean running = true;
-    private boolean isConnecting = false;
-    private final Object mqttLock = new Object();
-    private boolean isDiscoveryInProgress = false;
+    private volatile boolean running = true;
+    private volatile boolean isConnecting = false;
 
+    // Kolejka operacji sprzętowych (jeden wątek: zero wyścigów)
+    private final ExecutorService hwExecutor = Executors.newSingleThreadExecutor();
+    private Process inputMonitoringProc;
+
+    // Blokady zasilania
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private AudioManager audioManager;
+    private AudioManager.AudioRecordingCallback audioRecordingCallback;
+
+    // Deskryptory I/O
+    private FileOutputStream ttyOutStream;
+    private RandomAccessFile fbAccessFile;
 
     // Flagi sprzętowe
     private boolean isMainScreenOn = true;
@@ -74,12 +89,16 @@ public class BridgeService extends Service {
     private boolean isMicActive = false;
     private boolean isMicMuted = false;
 
-    // Alerty i powiadomienia
+    // Alerty
     private boolean hasUnreadAlert = false;
     private String alertBadgeText = "";
     private boolean isAlertKeepingAwake = false;
+    private String alertTitle = "";
+    private String alertMsg = "";
+    private String alertFooter = "";
+    private String alertColor = "#FF3D00";
 
-    // Tryby pracy ekranu
+    // Tryby pracy wyświetlacza
     private enum ScreenMode { CLOCK, GAUGE, MENU, MEDIA, ALERT }
     private ScreenMode currentMode = ScreenMode.CLOCK;
 
@@ -94,6 +113,7 @@ public class BridgeService extends Service {
     private int gaugeColor = Color.parseColor("#00E5FF");
     private float animatedSweep = 0f;
     private ValueAnimator gaugeAnimator;
+    private final AtomicBoolean isDrawGaugePending = new AtomicBoolean(false);
 
     // MENU
     private String menuTitle = "";
@@ -106,8 +126,35 @@ public class BridgeService extends Service {
     private String mediaTitle = "";
     private String mediaSub = "";
     private int mediaProgress = -1;
+    private Bitmap cachedMediaArt = null;
 
-    // Synchronizacja z głównym ekranem tabletu
+    // ZERO-ALLOCATION RENDER BUFFERS (240x240 RGB565)
+    private final Bitmap renderBmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
+    private final Canvas renderCanvas = new Canvas(renderBmp);
+    private final int[] pixelArray = new int[240 * 240];
+    private final byte[] rawFbBuffer = new byte[240 * 240 * 2];
+    private final RectF arcRect = new RectF(28, 28, 212, 212);
+    private final Rect fullScreenRect = new Rect(0, 0, 240, 240);
+
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint tickPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    // Wstępnie obliczone współrzędne 19 kresek tarczy zegarowej (zero trygonometrii w klatkach)
+    private static final float[] TICK_COORDS = new float[19 * 4];
+    static {
+        int idx = 0;
+        for (int angle = 135; angle <= 405; angle += 15) {
+            double rad = Math.toRadians(angle);
+            TICK_COORDS[idx++] = (float) (120 + 96 * Math.cos(rad));
+            TICK_COORDS[idx++] = (float) (120 + 96 * Math.sin(rad));
+            TICK_COORDS[idx++] = (float) (120 + 104 * Math.cos(rad));
+            TICK_COORDS[idx++] = (float) (120 + 104 * Math.sin(rad));
+        }
+    }
+
+    private final SimpleDateFormat timeFmt = new SimpleDateFormat("HH:mm", Locale.getDefault());
+    private final SimpleDateFormat dateFmt = new SimpleDateFormat("EEE, d MMM", new Locale("pl", "PL"));
+
     private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -121,37 +168,54 @@ public class BridgeService extends Service {
                 redrawCurrentScreen();
             } else if (Intent.ACTION_TIME_TICK.equals(action)) {
                 if (currentMode == ScreenMode.CLOCK && isScreenHardwarePowered) {
-                    drawClock();
+                    postRenderTask(BridgeService.this::drawClockInternal);
                 }
             }
+        }
+    };
+
+    private final BroadcastReceiver configReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            SharedPreferences prefs = getSharedPreferences("knob_prefs", MODE_PRIVATE);
+            SharedPreferences.Editor ed = prefs.edit();
+            if (intent.hasExtra("broker")) ed.putString("broker", intent.getStringExtra("broker"));
+            if (intent.hasExtra("user")) ed.putString("user", intent.getStringExtra("user"));
+            if (intent.hasExtra("pass")) ed.putString("pass", intent.getStringExtra("pass"));
+            if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
+            ed.apply();
+            loadConfig();
+            restartMqtt();
         }
     };
 
     @Override
     public void onCreate() {
         super.onCreate();
-        Log.i(TAG, "Startowanie usługi BridgeService...");
+        Log.i(TAG, "Start usługi BridgeService...");
         startForegroundNoti();
         acquireLocks();
-        loadConfigAndRegisterReceiver();
+        loadConfig();
 
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         initMicMonitoring();
 
-        new Thread(() -> {
-            initHardwarePermissions();
-            setHardwarePower(true);
-            drawClock();
-        }).start();
+        IntentFilter screenFilter = new IntentFilter();
+        screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
+        screenFilter.addAction(Intent.ACTION_SCREEN_ON);
+        screenFilter.addAction(Intent.ACTION_TIME_TICK);
+        registerReceiver(screenStateReceiver, screenFilter);
 
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(Intent.ACTION_SCREEN_OFF);
-        filter.addAction(Intent.ACTION_SCREEN_ON);
-        filter.addAction(Intent.ACTION_TIME_TICK);
-        registerReceiver(screenStateReceiver, filter);
+        IntentFilter cfgFilter = new IntentFilter("com.local.knobbridge.SET_CONFIG");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(configReceiver, cfgFilter, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(configReceiver, cfgFilter);
+        }
 
+        initHardware();
         startRootInputMonitoring();
-        startMqttLoop();
+        startMqtt();
     }
 
     private void acquireLocks() {
@@ -159,77 +223,164 @@ public class BridgeService extends Service {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KnobBridge::CpuLock");
+                wakeLock.setReferenceCounted(false);
                 wakeLock.acquire();
             }
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wm != null) {
                 wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KnobBridge::WifiLock");
+                wifiLock.setReferenceCounted(false);
                 wifiLock.acquire();
             }
-            Log.i(TAG, "WakeLock i WifiLock aktywne");
-        } catch (Exception e) {
-            Log.e(TAG, "Blad blokad", e);
-        }
+        } catch (Exception ignored) {}
     }
 
     private void startForegroundNoti() {
         NotificationChannel chan = new NotificationChannel("knob", "Knob Bridge", NotificationManager.IMPORTANCE_LOW);
-        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(chan);
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm != null) nm.createNotificationChannel(chan);
+
         Notification noti = new Notification.Builder(this, "knob")
                 .setContentTitle("Knob Engine Active")
+                .setContentText("Mostek sprzętowy i MQTT działają")
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .build();
-        startForeground(101, noti);
+
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(101, noti, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+        } else {
+            startForeground(101, noti);
+        }
     }
 
-    private void initHardwarePermissions() {
-        runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && chmod 666 /dev/ttyAS4 && chmod 666 /dev/graphics/fb1");
-        Log.i(TAG, "Porty /dev/ttyAS4 oraz /dev/graphics/fb1 zainicjalizowane");
+    private void loadConfig() {
+        SharedPreferences prefs = getSharedPreferences("knob_prefs", MODE_PRIVATE);
+        this.brokerUri = prefs.getString("broker", this.brokerUri);
+        this.mqttUser = prefs.getString("user", this.mqttUser);
+        this.mqttPass = prefs.getString("pass", this.mqttPass);
+        this.baseTopic = prefs.getString("topic", this.baseTopic);
+    }
+
+    // --- SPRZĘT: UART / SYSFS / FRAMEBUFFER ---
+    private void initHardware() {
+        hwExecutor.execute(() -> {
+            // Nadanie praw rootem jednorazowo przy starcie
+            runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && " +
+                    "chmod 666 /dev/ttyAS4 /dev/graphics/fb1 /dev/input/event0 /proc/vendor/lcd_ctrl /proc/vendor/led_ctrl /sys/class/graphics/fb1/blank");
+
+            try {
+                ttyOutStream = new FileOutputStream(new File("/dev/ttyAS4"));
+            } catch (Exception e) {
+                Log.w(TAG, "Bezpośrednie otwarcie TTY nie powiodło się, używam fallbacku");
+            }
+
+            try {
+                fbAccessFile = new RandomAccessFile("/dev/graphics/fb1", "rw");
+            } catch (Exception e) {
+                Log.w(TAG, "Bezpośrednie otwarcie FB1 nie powiodło się, używam fallbacku");
+            }
+
+            // Inicjalizacja wzmacniacza DSP (Master 15/20 odblokowuje strefy)
+            sendDspFrameSync(0xA1, 15, 1);
+            sendDspFrameSync(0xAE, 12, 1);
+            sendDspFrameSync(0xAF, 12, 1);
+            sendDspFrameSync(0xA1, 15, 2);
+            sendDspFrameSync(0xAE, 12, 2);
+            sendDspFrameSync(0xAF, 12, 2);
+            sendDspFrameSync(0xAB, 0xA0, 1); // EQ Bass Flat
+            sendDspFrameSync(0xAC, 0xA0, 1); // EQ Treble Flat
+
+            setHardwarePowerInternal(true);
+            drawClockInternal();
+        });
     }
 
     private void sendDspFrame(int cmd, int val, int room) {
-        new Thread(() -> {
-            byte[] frame = new byte[6];
-            frame[0] = (byte) 0xFA;
-            frame[1] = (byte) 0x01;
-            frame[2] = (byte) (cmd & 0xFF);
-            frame[3] = (byte) (val & 0xFF);
-            frame[4] = (byte) (room & 0xFF);
-            frame[5] = (byte) ((0xFA + 0x01 + (cmd & 0xFF) + (val & 0xFF) + (room & 0xFF)) & 0xFF);
-
-            try {
-                File f = new File("/dev/ttyAS4");
-                FileOutputStream fos = new FileOutputStream(f);
-                fos.write(frame);
-                fos.flush();
-                fos.close();
-            } catch (Exception e) {
-                String hexCmd = String.format(Locale.US, "printf '\\xFA\\x01\\x%02X\\x%02X\\x%02X\\x%02X' > /dev/ttyAS4",
-                        cmd & 0xFF, val & 0xFF, room & 0xFF, frame[5] & 0xFF);
-                runRootCmdSync(hexCmd);
-            }
-        }).start();
+        hwExecutor.execute(() -> sendDspFrameSync(cmd, val, room));
     }
 
+    private void sendDspFrameSync(int cmd, int val, int room) {
+        byte bCmd = (byte) (cmd & 0xFF);
+        byte bVal = (byte) (val & 0xFF);
+        byte bRoom = (byte) (room & 0xFF);
+        byte cs = (byte) ((0xFA + 0x01 + (cmd & 0xFF) + (val & 0xFF) + (room & 0xFF)) & 0xFF);
+        byte[] frame = new byte[]{(byte) 0xFA, 0x01, bCmd, bVal, bRoom, cs};
+
+        if (ttyOutStream != null) {
+            try {
+                ttyOutStream.write(frame);
+                ttyOutStream.flush();
+                return;
+            } catch (Exception e) {
+                try { ttyOutStream.close(); } catch (Exception ignored) {}
+                ttyOutStream = null;
+            }
+        }
+
+        // Fallback root command
+        String hexCmd = String.format(Locale.US, "printf '\\xFA\\x01\\x%02X\\x%02X\\x%02X\\x%02X' > /dev/ttyAS4",
+                bCmd, bVal, bRoom, cs);
+        runRootCmdSync(hexCmd);
+    }
+
+    private void writeSysFs(String path, String value) {
+        try (FileOutputStream fos = new FileOutputStream(path)) {
+            fos.write(value.getBytes());
+            fos.flush();
+        } catch (Exception e) {
+            runRootCmdSync("echo " + value + " > " + path);
+        }
+    }
+
+    private void setHardwarePower(boolean enable) {
+        isScreenHardwarePowered = enable;
+        hwExecutor.execute(() -> setHardwarePowerInternal(enable));
+    }
+
+    private void setHardwarePowerInternal(boolean enable) {
+        isScreenHardwarePowered = enable;
+        writeSysFs("/proc/vendor/lcd_ctrl", enable ? "on" : "off");
+        writeSysFs("/sys/class/graphics/fb1/blank", enable ? "0" : "4");
+        publishRaw(baseTopic + "/display/state", enable ? "on" : "off", true);
+    }
+
+    private void setLedRingHardware(boolean enable) {
+        hwExecutor.execute(() -> {
+            writeSysFs("/proc/vendor/led_ctrl", enable ? "on" : "off");
+            publishRaw(baseTopic + "/led/state", enable ? "on" : "off", true);
+        });
+    }
+
+    private void runRootCmdSync(String cmd) {
+        Process p = null;
+        try {
+            p = Runtime.getRuntime().exec(new String[]{"su", "0", "-c", cmd});
+            p.waitFor();
+        } catch (Exception ignored) {
+        } finally {
+            if (p != null) p.destroy();
+        }
+    }
+
+    // --- MIKROFON ---
     private void initMicMonitoring() {
         if (audioManager != null) {
             try { isMicMuted = audioManager.isMicrophoneMute(); } catch (Exception ignored) {}
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                try {
-                    audioManager.registerAudioRecordingCallback(new AudioManager.AudioRecordingCallback() {
-                        @Override
-                        public void onRecordingConfigChanged(List<AudioRecordingConfiguration> configs) {
-                            boolean active = (configs != null && !configs.isEmpty());
-                            if (isMicActive != active) {
-                                isMicActive = active;
-                                publishRaw(baseTopic + "/mic/active/state", active ? "ON" : "OFF", true);
-                                if (currentMode == ScreenMode.CLOCK) {
-                                    handler.post(() -> drawClock());
-                                }
+                audioRecordingCallback = new AudioManager.AudioRecordingCallback() {
+                    @Override
+                    public void onRecordingConfigChanged(List<AudioRecordingConfiguration> configs) {
+                        boolean active = (configs != null && !configs.isEmpty());
+                        if (isMicActive != active) {
+                            isMicActive = active;
+                            publishRaw(baseTopic + "/mic/active/state", active ? "ON" : "OFF", true);
+                            if (currentMode == ScreenMode.CLOCK && isScreenHardwarePowered) {
+                                postRenderTask(BridgeService.this::drawClockInternal);
                             }
                         }
-                    }, handler);
-                } catch (Exception ignored) {}
+                    }
+                };
+                audioManager.registerAudioRecordingCallback(audioRecordingCallback, handler);
             }
         }
     }
@@ -240,47 +391,20 @@ public class BridgeService extends Service {
                 audioManager.setMicrophoneMute(mute);
                 isMicMuted = audioManager.isMicrophoneMute();
                 publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-                if (currentMode == ScreenMode.CLOCK) drawClock();
+                if (currentMode == ScreenMode.CLOCK && isScreenHardwarePowered) {
+                    postRenderTask(this::drawClockInternal);
+                }
             } catch (Exception ignored) {}
         }
     }
 
-    private void setHardwarePower(boolean enable) {
-        isScreenHardwarePowered = enable;
-        new Thread(() -> {
-            runRootCmdSync(enable ? "echo on > /proc/vendor/lcd_ctrl && echo 0 > /sys/class/graphics/fb1/blank"
-                                  : "echo off > /proc/vendor/lcd_ctrl && echo 4 > /sys/class/graphics/fb1/blank");
-            publishRaw(baseTopic + "/display/state", enable ? "on" : "off", true);
-        }).start();
-    }
-
-    private void setLedRingHardware(boolean enable) {
-        new Thread(() -> {
-            runRootCmdSync(enable ? "echo on > /proc/vendor/led_ctrl" : "echo off > /proc/vendor/led_ctrl");
-            publishRaw(baseTopic + "/led/state", enable ? "on" : "off", true);
-        }).start();
-    }
-
-    private void runRootCmdSync(String cmd) {
-        try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "0"});
-            OutputStream os = p.getOutputStream();
-            os.write((cmd + "\nexit\n").getBytes());
-            os.flush();
-            p.waitFor();
-        } catch (Exception ignored) {}
-    }
-
+    // --- ODCZYT ENKODERA ---
     private void startRootInputMonitoring() {
         new Thread(() -> {
             while (running) {
                 try {
-                    Process proc = Runtime.getRuntime().exec(new String[]{"su", "0"});
-                    OutputStream os = proc.getOutputStream();
-                    os.write("getevent -l /dev/input/event0\n".getBytes());
-                    os.flush();
-
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+                    inputMonitoringProc = Runtime.getRuntime().exec(new String[]{"su", "0", "-c", "getevent -l /dev/input/event0"});
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(inputMonitoringProc.getInputStream()));
                     String line;
                     while (running && (line = reader.readLine()) != null) {
                         if (line.contains("DOWN") || line.contains(" 00000001")) {
@@ -289,11 +413,18 @@ public class BridgeService extends Service {
                             else if (line.contains("KEY_F3")) handleKnobClick();
                         }
                     }
-                } catch (Exception e) {
+                } catch (Exception ignored) {
+                } finally {
+                    if (inputMonitoringProc != null) {
+                        inputMonitoringProc.destroy();
+                        inputMonitoringProc = null;
+                    }
+                }
+                if (running) {
                     try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                 }
             }
-        }).start();
+        }, "KnobInputThread").start();
     }
 
     private void handleKnobEvent(int delta) {
@@ -315,7 +446,7 @@ public class BridgeService extends Service {
             case MENU:
                 if (!menuItems.isEmpty()) {
                     menuIndex = (menuIndex + delta + menuItems.size()) % menuItems.size();
-                    drawMenuScreen();
+                    postRenderTask(this::drawMenuScreenInternal);
                     resetTimeout(5000);
                 }
                 break;
@@ -344,7 +475,6 @@ public class BridgeService extends Service {
 
         if (currentMode == ScreenMode.GAUGE) {
             publishRaw(baseTopic + "/knob/confirm", String.valueOf(gaugeValue), false);
-            gaugeValue = 0;
             returnToClock();
             return;
         }
@@ -362,8 +492,8 @@ public class BridgeService extends Service {
     }
 
     private void publishAction(String action) {
+        publishRaw(baseTopic + "/knob/action", action, false);
         try {
-            publishRaw(baseTopic + "/knob/action", action, false);
             JSONObject eventObj = new JSONObject();
             eventObj.put("event_type", action);
             eventObj.put("timestamp", System.currentTimeMillis());
@@ -373,8 +503,7 @@ public class BridgeService extends Service {
 
     private final Runnable timeoutCancelTask = () -> {
         if (currentMode == ScreenMode.GAUGE || currentMode == ScreenMode.MENU) {
-            publishRaw(baseTopic + "/knob/cancel", "{\"canceled_mode\":\"" + currentMode.name().toLowerCase() + "\"}", false);
-            gaugeValue = 0;
+            publishRaw(baseTopic + "/knob/cancel", "{\"canceled_mode\":\"" + currentMode.name().toLowerCase(Locale.ROOT) + "\"}", false);
             menuItems.clear();
         }
         returnToClock();
@@ -388,51 +517,32 @@ public class BridgeService extends Service {
     private void returnToClock() {
         handler.removeCallbacks(timeoutCancelTask);
         currentMode = ScreenMode.CLOCK;
-        if (isScreenHardwarePowered) drawClock();
+        if (cachedMediaArt != null) {
+            cachedMediaArt.recycle();
+            cachedMediaArt = null;
+        }
+        if (isScreenHardwarePowered) postRenderTask(this::drawClockInternal);
     }
 
-    private void loadConfigAndRegisterReceiver() {
-        SharedPreferences prefs = getSharedPreferences("knob_prefs", MODE_PRIVATE);
-        this.brokerUri = prefs.getString("broker", this.brokerUri);
-        this.mqttUser = prefs.getString("user", this.mqttUser);
-        this.mqttPass = prefs.getString("pass", this.mqttPass);
-        this.baseTopic = prefs.getString("topic", this.baseTopic);
-
-        IntentFilter filter = new IntentFilter("com.local.knobbridge.SET_CONFIG");
-        registerReceiver(new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                SharedPreferences.Editor ed = prefs.edit();
-                if (intent.hasExtra("broker")) ed.putString("broker", intent.getStringExtra("broker"));
-                if (intent.hasExtra("user")) ed.putString("user", intent.getStringExtra("user"));
-                if (intent.hasExtra("pass")) ed.putString("pass", intent.getStringExtra("pass"));
-                if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
-                ed.apply();
-                loadConfigAndRegisterReceiver();
-                startMqttLoop();
-            }
-        }, filter, Context.RECEIVER_EXPORTED);
-    }
-
-    private synchronized void startMqttLoop() {
-        if (isConnecting) return;
+    // --- OBSŁUGA MQTT ---
+    private synchronized void startMqtt() {
+        if (isConnecting || (client != null && client.isConnected())) return;
         isConnecting = true;
 
         new Thread(() -> {
             try {
-                if (client != null && client.isConnected()) {
-                    isConnecting = false;
-                    return;
+                if (client != null) {
+                    try { client.disconnectForcibly(1000); client.close(); } catch (Exception ignored) {}
+                    client = null;
                 }
 
-                Log.i(TAG, "Łączenie z brokerem MQTT: " + brokerUri);
-                client = new MqttClient(brokerUri, "PanelKnobEngine_" + System.currentTimeMillis(), new MemoryPersistence());
+                client = new MqttClient(brokerUri, "PanelKnobEngine_" + Build.SERIAL, new MemoryPersistence());
                 MqttConnectOptions opts = new MqttConnectOptions();
                 opts.setCleanSession(true);
                 opts.setAutomaticReconnect(true);
-                opts.setKeepAliveInterval(20);
-                opts.setConnectionTimeout(15);
-                opts.setMaxInflight(100);
+                opts.setKeepAliveInterval(15);
+                opts.setConnectionTimeout(10);
+                opts.setMaxInflight(50);
                 if (!mqttUser.isEmpty()) {
                     opts.setUserName(mqttUser);
                     opts.setPassword(mqttPass.toCharArray());
@@ -441,21 +551,16 @@ public class BridgeService extends Service {
                 client.setCallback(new MqttCallbackExtended() {
                     @Override
                     public void connectComplete(boolean reconnect, String serverURI) {
-                        Log.i(TAG, "MQTT połączone (reconnect=" + reconnect + "). Rejestruję encje...");
-                        new Thread(() -> {
-                            synchronized (mqttLock) {
-                                subscribeTopics();
-                                publishHomeAssistantDiscovery();
-                                publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-                                publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
-                            }
-                        }).start();
+                        Log.i(TAG, "MQTT połączone. Rejestruję encje...");
+                        subscribeTopics();
+                        publishHomeAssistantDiscovery();
+                        publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
+                        publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
                     }
 
                     @Override
                     public void connectionLost(Throwable cause) {
-                        Log.w(TAG, "MQTT utracone: " + (cause != null ? cause.getMessage() : "unknown"));
-                        handler.postDelayed(() -> startMqttLoop(), 4000);
+                        Log.w(TAG, "MQTT utracone. Paho ponowi próbę w tle...");
                     }
 
                     @Override
@@ -470,11 +575,19 @@ public class BridgeService extends Service {
                 client.connect(opts);
             } catch (Exception e) {
                 Log.e(TAG, "Błąd łączenia z MQTT (" + e.getMessage() + "), ponawiam za 5s...");
-                handler.postDelayed(() -> startMqttLoop(), 5000);
+                handler.postDelayed(BridgeService.this::startMqtt, 5000);
             } finally {
                 isConnecting = false;
             }
-        }).start();
+        }, "MqttConnectThread").start();
+    }
+
+    private void restartMqtt() {
+        if (client != null) {
+            try { client.disconnectForcibly(500); client.close(); } catch (Exception ignored) {}
+            client = null;
+        }
+        startMqtt();
     }
 
     private void subscribeTopics() {
@@ -486,11 +599,8 @@ public class BridgeService extends Service {
                         baseTopic + "/dsp/#",
                         baseTopic + "/mic/#"
                 }, new int[]{0, 0, 0, 0});
-                Log.i(TAG, "Pomyślnie zasubskrybowano tematy panelu");
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd subskrypcji", e);
-        }
+        } catch (Exception ignored) {}
     }
 
     private void publishRaw(String topic, String payload, boolean retained) {
@@ -501,16 +611,10 @@ public class BridgeService extends Service {
                 msg.setRetained(retained);
                 client.publish(topic, msg);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd wysyłania na " + topic + ": " + e.getMessage());
-        }
+        } catch (Exception ignored) {}
     }
 
     private void publishHomeAssistantDiscovery() {
-        if (isDiscoveryInProgress) return;
-        isDiscoveryInProgress = true;
-        Log.i(TAG, "Wysyłanie Discovery...");
-
         try {
             JSONObject device = new JSONObject();
             device.put("identifiers", new JSONArray().put("panel_knob_engine_v4"));
@@ -518,7 +622,6 @@ public class BridgeService extends Service {
             device.put("model", "Allwinner DSP Knob 240x240");
             device.put("manufacturer", "Smart Home Lab");
 
-            // Event i sensory
             JSONObject ev = new JSONObject();
             ev.put("name", "Zdarzenie Gałki");
             ev.put("unique_id", "knob_event_trigger_v4");
@@ -587,17 +690,14 @@ public class BridgeService extends Service {
             micA.put("device", device);
             publishRaw("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
 
-            // Strefa 1 (Master, L, P)
             registerNumberEntity("dsp_z1_master", "Strefa 1 Głośność Główna", baseTopic + "/dsp/z1/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z1_left", "Strefa 1 Głośnik Lewy", baseTopic + "/dsp/z1/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z1_right", "Strefa 1 Głośnik Prawy", baseTopic + "/dsp/z1/right", 0, 20, "mdi:speaker", device);
 
-            // Strefa 2 (Master, L, P)
             registerNumberEntity("dsp_z2_master", "Strefa 2 Głośność Główna", baseTopic + "/dsp/z2/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z2_left", "Strefa 2 Głośnik Lewy", baseTopic + "/dsp/z2/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z2_right", "Strefa 2 Głośnik Prawy", baseTopic + "/dsp/z2/right", 0, 20, "mdi:speaker", device);
 
-            // Equalizer
             registerNumberEntity("dsp_eq_bass", "Korektor Basy", baseTopic + "/dsp/eq/bass", -10, 10, "mdi:equalizer", device);
             registerNumberEntity("dsp_eq_treble", "Korektor Soprany", baseTopic + "/dsp/eq/treble", -10, 10, "mdi:equalizer", device);
 
@@ -611,10 +711,17 @@ public class BridgeService extends Service {
             eqProf.put("device", device);
             publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
 
-            Log.i(TAG, "Discovery wysłane pomyślnie");
-        } catch (Exception ignored) {} finally {
-            isDiscoveryInProgress = false;
-        }
+            // Publikacja stanów początkowych
+            publishRaw(baseTopic + "/dsp/z1/master/state", "15", true);
+            publishRaw(baseTopic + "/dsp/z1/left/state", "12", true);
+            publishRaw(baseTopic + "/dsp/z1/right/state", "12", true);
+            publishRaw(baseTopic + "/dsp/z2/master/state", "15", true);
+            publishRaw(baseTopic + "/dsp/z2/left/state", "12", true);
+            publishRaw(baseTopic + "/dsp/z2/right/state", "12", true);
+            publishRaw(baseTopic + "/dsp/eq/bass/state", "0", true);
+            publishRaw(baseTopic + "/dsp/eq/treble/state", "0", true);
+            publishRaw(baseTopic + "/dsp/eq/mode/state", "Standard", true);
+        } catch (Exception ignored) {}
     }
 
     private void registerNumberEntity(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) {
@@ -633,10 +740,19 @@ public class BridgeService extends Service {
         } catch (Exception ignored) {}
     }
 
+    private int parseClampedInt(String payload, int min, int max, int defaultVal) {
+        if (payload == null || payload.isEmpty()) return defaultVal;
+        try {
+            double d = Double.parseDouble(payload.trim());
+            int val = (int) Math.round(d);
+            return Math.max(min, Math.min(max, val));
+        } catch (Exception e) {
+            return defaultVal;
+        }
+    }
+
     private void handleIncomingMqtt(String topic, String payload) {
         try {
-            Log.d(TAG, "Odebrano MQTT: " + topic + " -> " + payload);
-
             if (topic.equals(baseTopic + "/mic/mute/set")) {
                 setMicrophoneMute("ON".equalsIgnoreCase(payload) || "true".equalsIgnoreCase(payload));
                 return;
@@ -644,19 +760,19 @@ public class BridgeService extends Service {
 
             // DSP Strefa 1
             if (topic.equals(baseTopic + "/dsp/z1/master/set")) {
-                int val = Integer.parseInt(payload);
+                int val = parseClampedInt(payload, 0, 20, 15);
                 sendDspFrame(0xA1, val, 1);
                 publishRaw(baseTopic + "/dsp/z1/master/state", String.valueOf(val), true);
                 return;
             }
             if (topic.equals(baseTopic + "/dsp/z1/left/set")) {
-                int val = Integer.parseInt(payload);
+                int val = parseClampedInt(payload, 0, 20, 12);
                 sendDspFrame(0xAE, val, 1);
                 publishRaw(baseTopic + "/dsp/z1/left/state", String.valueOf(val), true);
                 return;
             }
             if (topic.equals(baseTopic + "/dsp/z1/right/set")) {
-                int val = Integer.parseInt(payload);
+                int val = parseClampedInt(payload, 0, 20, 12);
                 sendDspFrame(0xAF, val, 1);
                 publishRaw(baseTopic + "/dsp/z1/right/state", String.valueOf(val), true);
                 return;
@@ -664,19 +780,19 @@ public class BridgeService extends Service {
 
             // DSP Strefa 2
             if (topic.equals(baseTopic + "/dsp/z2/master/set")) {
-                int val = Integer.parseInt(payload);
+                int val = parseClampedInt(payload, 0, 20, 15);
                 sendDspFrame(0xA1, val, 2);
                 publishRaw(baseTopic + "/dsp/z2/master/state", String.valueOf(val), true);
                 return;
             }
             if (topic.equals(baseTopic + "/dsp/z2/left/set")) {
-                int val = Integer.parseInt(payload);
+                int val = parseClampedInt(payload, 0, 20, 12);
                 sendDspFrame(0xAE, val, 2);
                 publishRaw(baseTopic + "/dsp/z2/left/state", String.valueOf(val), true);
                 return;
             }
             if (topic.equals(baseTopic + "/dsp/z2/right/set")) {
-                int val = Integer.parseInt(payload);
+                int val = parseClampedInt(payload, 0, 20, 12);
                 sendDspFrame(0xAF, val, 2);
                 publishRaw(baseTopic + "/dsp/z2/right/state", String.valueOf(val), true);
                 return;
@@ -684,7 +800,7 @@ public class BridgeService extends Service {
 
             // DSP EQ
             if (topic.equals(baseTopic + "/dsp/eq/bass/set")) {
-                int db = Integer.parseInt(payload);
+                int db = parseClampedInt(payload, -10, 10, 0);
                 int hex = 0xA0 + db;
                 sendDspFrame(0xAB, hex, 1);
                 sendDspFrame(0xAB, hex, 2);
@@ -692,7 +808,7 @@ public class BridgeService extends Service {
                 return;
             }
             if (topic.equals(baseTopic + "/dsp/eq/treble/set")) {
-                int db = Integer.parseInt(payload);
+                int db = parseClampedInt(payload, -10, 10, 0);
                 int hex = 0xA0 + db;
                 sendDspFrame(0xAC, hex, 1);
                 sendDspFrame(0xAC, hex, 2);
@@ -700,18 +816,19 @@ public class BridgeService extends Service {
                 return;
             }
             if (topic.equals(baseTopic + "/dsp/eq/mode/set")) {
-                int modeVal = 1;
-                switch (payload.toLowerCase()) {
-                    case "pop": modeVal = 2; break;
-                    case "rock": modeVal = 3; break;
-                    case "classic": modeVal = 4; break;
-                    case "jazz": modeVal = 5; break;
-                    case "vocal": modeVal = 6; break;
-                    default: modeVal = 1; break;
+                int modeVal;
+                String modeName;
+                switch (payload.trim().toLowerCase(Locale.ROOT)) {
+                    case "pop": modeVal = 2; modeName = "Pop"; break;
+                    case "rock": modeVal = 3; modeName = "Rock"; break;
+                    case "classic": modeVal = 4; modeName = "Classic"; break;
+                    case "jazz": modeVal = 5; modeName = "Jazz"; break;
+                    case "vocal": modeVal = 6; modeName = "Vocal"; break;
+                    default: modeVal = 1; modeName = "Standard"; break;
                 }
                 sendDspFrame(0xA2, modeVal, 1);
                 sendDspFrame(0xA2, modeVal, 2);
-                publishRaw(baseTopic + "/dsp/eq/mode/state", payload, true);
+                publishRaw(baseTopic + "/dsp/eq/mode/state", modeName, true);
                 return;
             }
 
@@ -765,7 +882,7 @@ public class BridgeService extends Service {
 
                 currentMode = ScreenMode.MENU;
                 ensureScreenAwake();
-                drawMenuScreen();
+                postRenderTask(this::drawMenuScreenInternal);
                 resetTimeout(j.optInt("timeout", 5000));
                 return;
             }
@@ -777,31 +894,45 @@ public class BridgeService extends Service {
                 mediaSub = j.optString("sub", j.optString("artist", ""));
                 mediaProgress = j.optInt("progress", -1);
 
+                String b64 = j.optString("image_base64", "");
+                if (!b64.isEmpty()) {
+                    try {
+                        byte[] raw = Base64.decode(b64, Base64.DEFAULT);
+                        BitmapFactory.Options opts = new BitmapFactory.Options();
+                        opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                        Bitmap decoded = BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+                        if (decoded != null) {
+                            if (cachedMediaArt != null) cachedMediaArt.recycle();
+                            cachedMediaArt = decoded;
+                        }
+                    } catch (Exception ignored) {}
+                }
+
                 currentMode = ScreenMode.MEDIA;
                 ensureScreenAwake();
-                drawMediaScreen(j.optString("image_base64", ""));
+                postRenderTask(this::drawMediaScreenInternal);
                 resetTimeout(j.optInt("timeout", 10000));
                 return;
             }
 
             if (topic.equals(baseTopic + "/display/alert")) {
                 JSONObject j = new JSONObject(payload);
-                String title = j.optString("title", "");
-                String msg = j.optString("text", "");
-                String footer = j.optString("footer", "");
-                String color = j.optString("color", "#FF3D00");
+                alertTitle = j.optString("title", "");
+                alertMsg = j.optString("text", "");
+                alertFooter = j.optString("footer", "");
+                alertColor = j.optString("color", "#FF3D00");
                 boolean keepAwake = j.optBoolean("keep_awake", false);
                 boolean setBadge = j.optBoolean("badge", false);
 
                 if (setBadge) {
                     hasUnreadAlert = true;
-                    alertBadgeText = title.isEmpty() ? "ALERT" : title;
+                    alertBadgeText = alertTitle.isEmpty() ? "ALERT" : alertTitle;
                 }
                 isAlertKeepingAwake = keepAwake;
 
                 currentMode = ScreenMode.ALERT;
                 setHardwarePower(true);
-                drawAlertScreen(title, msg, footer, color);
+                postRenderTask(this::drawAlertScreenInternal);
 
                 if (!keepAwake) resetTimeout(j.optInt("duration", 4000));
                 else handler.removeCallbacks(timeoutCancelTask);
@@ -812,9 +943,7 @@ public class BridgeService extends Service {
                 returnToClock();
             }
 
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd parsowania MQTT", e);
-        }
+        } catch (Exception ignored) {}
     }
 
     private void ensureScreenAwake() {
@@ -823,16 +952,25 @@ public class BridgeService extends Service {
 
     private void redrawCurrentScreen() {
         if (!isScreenHardwarePowered) return;
-        if (currentMode == ScreenMode.GAUGE) drawGaugeScreen();
-        else if (currentMode == ScreenMode.MENU) drawMenuScreen();
-        else if (currentMode == ScreenMode.MEDIA) drawMediaScreen("");
-        else drawClock();
+        switch (currentMode) {
+            case GAUGE: postRenderTask(this::drawGaugeScreenInternal); break;
+            case MENU: postRenderTask(this::drawMenuScreenInternal); break;
+            case MEDIA: postRenderTask(this::drawMediaScreenInternal); break;
+            case ALERT: postRenderTask(this::drawAlertScreenInternal); break;
+            default: postRenderTask(this::drawClockInternal); break;
+        }
+    }
+
+    private void postRenderTask(Runnable renderTask) {
+        if (isScreenHardwarePowered && !hwExecutor.isShutdown()) {
+            hwExecutor.execute(renderTask);
+        }
     }
 
     private void animateGaugeToValue(int targetVal) {
         handler.post(() -> {
             float range = Math.max(1, gaugeMax - gaugeMin);
-            float pct = ((float)(targetVal - gaugeMin)) / range;
+            float pct = ((float) (targetVal - gaugeMin)) / range;
             float targetSweep = 270f * Math.max(0f, Math.min(1f, pct));
 
             if (gaugeAnimator != null && gaugeAnimator.isRunning()) {
@@ -844,263 +982,254 @@ public class BridgeService extends Service {
             gaugeAnimator.setInterpolator(new DecelerateInterpolator());
             gaugeAnimator.addUpdateListener(anim -> {
                 animatedSweep = (float) anim.getAnimatedValue();
-                drawGaugeScreen();
+                if (isDrawGaugePending.compareAndSet(false, true)) {
+                    postRenderTask(() -> {
+                        isDrawGaugePending.set(false);
+                        drawGaugeScreenInternal();
+                    });
+                }
             });
             gaugeAnimator.start();
         });
     }
 
-    private synchronized void drawClock() {
-        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
-        Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
-
-        Paint p = new Paint();
-        p.setAntiAlias(true);
-        p.setTextAlign(Paint.Align.CENTER);
+    // --- RYSOWANIE GRAFIKI (Wątek sprzętowy: Zero wyścigów i Zero alokacji) ---
+    private void drawClockInternal() {
+        renderCanvas.drawColor(Color.BLACK);
+        paint.reset();
+        paint.setAntiAlias(true);
+        paint.setTextAlign(Paint.Align.CENTER);
 
         if (isMicMuted) {
-            p.setColor(Color.parseColor("#FFA000"));
-            p.setTextSize(16);
-            p.setTypeface(Typeface.DEFAULT_BOLD);
-            canvas.drawText("MIC: WYCISZONY", 120, 38, p);
+            paint.setColor(Color.parseColor("#FFA000"));
+            paint.setTextSize(16);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            renderCanvas.drawText("MIC: WYCISZONY", 120, 38, paint);
         } else if (isMicActive) {
-            p.setColor(Color.parseColor("#FF1744"));
-            p.setTextSize(16);
-            p.setTypeface(Typeface.DEFAULT_BOLD);
-            canvas.drawText("● MIC AKTYWNY", 120, 38, p);
+            paint.setColor(Color.parseColor("#FF1744"));
+            paint.setTextSize(16);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            renderCanvas.drawText("● MIC AKTYWNY", 120, 38, paint);
         } else if (hasUnreadAlert) {
-            p.setColor(Color.parseColor("#00E5FF"));
-            p.setTextSize(16);
-            p.setTypeface(Typeface.DEFAULT_BOLD);
-            canvas.drawText("● " + alertBadgeText, 120, 38, p);
+            paint.setColor(Color.parseColor("#00E5FF"));
+            paint.setTextSize(16);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            renderCanvas.drawText("● " + alertBadgeText, 120, 38, paint);
         }
 
         Date now = new Date();
-        p.setColor(Color.WHITE);
-        p.setTextSize(70);
-        p.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(new SimpleDateFormat("HH:mm", Locale.getDefault()).format(now), 120, 130, p);
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(70);
+        paint.setTypeface(Typeface.DEFAULT_BOLD);
+        renderCanvas.drawText(timeFmt.format(now), 120, 130, paint);
 
-        p.setColor(Color.LTGRAY);
-        p.setTextSize(22);
-        p.setTypeface(Typeface.DEFAULT);
-        canvas.drawText(new SimpleDateFormat("EEE, d MMM", new Locale("pl", "PL")).format(now), 120, 170, p);
+        paint.setColor(Color.LTGRAY);
+        paint.setTextSize(22);
+        paint.setTypeface(Typeface.DEFAULT);
+        renderCanvas.drawText(dateFmt.format(now), 120, 170, paint);
 
-        renderToFramebuffer(bmp);
+        renderToFramebufferInternal();
     }
 
-    private synchronized void drawGaugeScreen() {
-        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
-        Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
+    private void drawGaugeScreenInternal() {
+        renderCanvas.drawColor(Color.BLACK);
 
-        Paint tickPaint = new Paint();
-        tickPaint.setAntiAlias(true);
         tickPaint.setColor(Color.parseColor("#333333"));
         tickPaint.setStrokeWidth(2.5f);
+        renderCanvas.drawLines(TICK_COORDS, tickPaint);
 
-        for (int angle = 135; angle <= 405; angle += 15) {
-            double rad = Math.toRadians(angle);
-            float startX = (float) (120 + 96 * Math.cos(rad));
-            float startY = (float) (120 + 96 * Math.sin(rad));
-            float stopX = (float) (120 + 104 * Math.cos(rad));
-            float stopY = (float) (120 + 104 * Math.sin(rad));
-            canvas.drawLine(startX, startY, stopX, stopY, tickPaint);
-        }
+        paint.reset();
+        paint.setAntiAlias(true);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(14);
+        paint.setColor(Color.parseColor("#222222"));
+        renderCanvas.drawArc(arcRect, 135, 270, false, paint);
 
-        RectF arcRect = new RectF(28, 28, 212, 212);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setColor(gaugeColor);
+        renderCanvas.drawArc(arcRect, 135, animatedSweep, false, paint);
 
-        Paint bgPaint = new Paint();
-        bgPaint.setAntiAlias(true);
-        bgPaint.setStyle(Paint.Style.STROKE);
-        bgPaint.setStrokeWidth(14);
-        bgPaint.setColor(Color.parseColor("#222222"));
-        canvas.drawArc(arcRect, 135, 270, false, bgPaint);
-
-        Paint fgPaint = new Paint();
-        fgPaint.setAntiAlias(true);
-        fgPaint.setStyle(Paint.Style.STROKE);
-        fgPaint.setStrokeWidth(14);
-        fgPaint.setStrokeCap(Paint.Cap.ROUND);
-        fgPaint.setColor(gaugeColor);
-        canvas.drawArc(arcRect, 135, animatedSweep, false, fgPaint);
-
-        Paint tp = new Paint();
-        tp.setAntiAlias(true);
-        tp.setTextAlign(Paint.Align.CENTER);
+        paint.reset();
+        paint.setAntiAlias(true);
+        paint.setTextAlign(Paint.Align.CENTER);
 
         if (!gaugeTitle.isEmpty()) {
-            tp.setColor(Color.LTGRAY);
-            tp.setTextSize(20);
-            canvas.drawText(gaugeTitle, 120, 78, tp);
+            paint.setColor(Color.LTGRAY);
+            paint.setTextSize(20);
+            renderCanvas.drawText(gaugeTitle, 120, 78, paint);
         }
 
-        tp.setColor(Color.WHITE);
-        tp.setTextSize(52);
-        tp.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(gaugeValue + gaugeUnit, 120, gaugeTitle.isEmpty() ? 125 : 135, tp);
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(52);
+        paint.setTypeface(Typeface.DEFAULT_BOLD);
+        renderCanvas.drawText(gaugeValue + gaugeUnit, 120, gaugeTitle.isEmpty() ? 125 : 135, paint);
 
         if (!gaugeFooter.isEmpty()) {
-            tp.setColor(Color.GRAY);
-            tp.setTextSize(16);
-            tp.setTypeface(Typeface.DEFAULT);
-            canvas.drawText(gaugeFooter, 120, 185, tp);
+            paint.setColor(Color.GRAY);
+            paint.setTextSize(16);
+            paint.setTypeface(Typeface.DEFAULT);
+            renderCanvas.drawText(gaugeFooter, 120, 185, paint);
         }
 
-        renderToFramebuffer(bmp);
+        renderToFramebufferInternal();
     }
 
-    private synchronized void drawMenuScreen() {
-        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
-        Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
-
-        Paint p = new Paint();
-        p.setAntiAlias(true);
-        p.setTextAlign(Paint.Align.CENTER);
+    private void drawMenuScreenInternal() {
+        renderCanvas.drawColor(Color.BLACK);
+        paint.reset();
+        paint.setAntiAlias(true);
+        paint.setTextAlign(Paint.Align.CENTER);
 
         if (!menuTitle.isEmpty()) {
-            p.setColor(Color.parseColor("#FFA726"));
-            p.setTextSize(20);
-            p.setTypeface(Typeface.DEFAULT_BOLD);
-            canvas.drawText(menuTitle.toUpperCase(), 120, 48, p);
+            paint.setColor(Color.parseColor("#FFA726"));
+            paint.setTextSize(20);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            renderCanvas.drawText(menuTitle.toUpperCase(Locale.ROOT), 120, 48, paint);
         }
 
         if (!menuItems.isEmpty()) {
-            p.setColor(Color.GRAY);
-            p.setTextSize(16);
-            canvas.drawText((menuIndex + 1) + " / " + menuItems.size(), 120, 72, p);
+            paint.setColor(Color.GRAY);
+            paint.setTextSize(16);
+            renderCanvas.drawText((menuIndex + 1) + " / " + menuItems.size(), 120, 72, paint);
 
             String currentItem = menuItems.get(menuIndex);
-            p.setColor(Color.WHITE);
-            p.setTextSize(currentItem.length() > 10 ? 26 : 32);
-            p.setTypeface(Typeface.DEFAULT_BOLD);
-            canvas.drawText(currentItem, 120, 135, p);
+            paint.setColor(Color.WHITE);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
 
-            p.setColor(Color.parseColor("#00E5FF"));
-            p.setTextSize(24);
-            canvas.drawText("◀          ▶", 120, 135, p);
+            // Dynamiczne dopasowanie fontu, aby tekst nie wychodził poza okrągły ekran
+            float fontSize = 32f;
+            paint.setTextSize(fontSize);
+            while (fontSize > 16f && paint.measureText(currentItem) > 160f) {
+                fontSize -= 2f;
+                paint.setTextSize(fontSize);
+            }
+            renderCanvas.drawText(currentItem, 120, 135, paint);
+
+            paint.setColor(Color.parseColor("#00E5FF"));
+            paint.setTextSize(24);
+            renderCanvas.drawText("◀          ▶", 120, 135, paint);
         }
 
         if (!menuFooter.isEmpty()) {
-            p.setColor(Color.GRAY);
-            p.setTextSize(16);
-            p.setTypeface(Typeface.DEFAULT);
-            canvas.drawText(menuFooter, 120, 195, p);
+            paint.setColor(Color.GRAY);
+            paint.setTextSize(16);
+            paint.setTypeface(Typeface.DEFAULT);
+            renderCanvas.drawText(menuFooter, 120, 195, paint);
         }
 
-        renderToFramebuffer(bmp);
+        renderToFramebufferInternal();
     }
 
-    private synchronized void drawMediaScreen(String base64Img) {
-        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
-        Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
+    private void drawMediaScreenInternal() {
+        renderCanvas.drawColor(Color.BLACK);
 
-        if (!base64Img.isEmpty()) {
-            try {
-                byte[] raw = Base64.decode(base64Img, Base64.DEFAULT);
-                Bitmap art = BitmapFactory.decodeByteArray(raw, 0, raw.length);
-                if (art != null) {
-                    canvas.drawBitmap(Bitmap.createScaledBitmap(art, 240, 240, true), 0, 0, null);
-                    renderToFramebuffer(bmp);
-                    return;
-                }
-            } catch (Exception ignored) {}
+        if (cachedMediaArt != null && !cachedMediaArt.isRecycled()) {
+            renderCanvas.drawBitmap(cachedMediaArt, null, fullScreenRect, null);
+            renderToFramebufferInternal();
+            return;
         }
 
-        Paint p = new Paint();
-        p.setAntiAlias(true);
-        p.setTextAlign(Paint.Align.CENTER);
+        paint.reset();
+        paint.setAntiAlias(true);
+        paint.setTextAlign(Paint.Align.CENTER);
 
         if (!mediaHeader.isEmpty()) {
-            p.setColor(Color.parseColor("#E91E63"));
-            p.setTextSize(20);
-            p.setTypeface(Typeface.DEFAULT_BOLD);
-            canvas.drawText(mediaHeader, 120, 50, p);
+            paint.setColor(Color.parseColor("#E91E63"));
+            paint.setTextSize(20);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            renderCanvas.drawText(mediaHeader, 120, 50, paint);
         }
 
-        p.setColor(Color.WHITE);
-        p.setTextSize(mediaTitle.length() > 10 ? 26 : 32);
-        p.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(mediaTitle, 120, mediaHeader.isEmpty() ? 110 : 120, p);
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(mediaTitle.length() > 10 ? 26 : 32);
+        paint.setTypeface(Typeface.DEFAULT_BOLD);
+        renderCanvas.drawText(mediaTitle, 120, mediaHeader.isEmpty() ? 110 : 120, paint);
 
         if (!mediaSub.isEmpty()) {
-            p.setColor(Color.LTGRAY);
-            p.setTextSize(20);
-            p.setTypeface(Typeface.DEFAULT);
-            canvas.drawText(mediaSub, 120, 155, p);
+            paint.setColor(Color.LTGRAY);
+            paint.setTextSize(20);
+            paint.setTypeface(Typeface.DEFAULT);
+            renderCanvas.drawText(mediaSub, 120, 155, paint);
         }
 
         if (mediaProgress >= 0) {
-            Paint barBg = new Paint();
-            barBg.setColor(Color.DKGRAY);
-            canvas.drawRect(40, 185, 200, 191, barBg);
+            paint.setColor(Color.DKGRAY);
+            renderCanvas.drawRect(40, 185, 200, 191, paint);
 
-            Paint barFg = new Paint();
-            barFg.setColor(Color.parseColor("#E91E63"));
+            paint.setColor(Color.parseColor("#E91E63"));
             float w = (160f * Math.max(0, Math.min(100, mediaProgress))) / 100f;
-            canvas.drawRect(40, 185, 40 + w, 191, barFg);
+            renderCanvas.drawRect(40, 185, 40 + w, 191, paint);
         }
 
-        renderToFramebuffer(bmp);
+        renderToFramebufferInternal();
     }
 
-    private synchronized void drawAlertScreen(String title, String msg, String footer, String colorHex) {
-        Bitmap bmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
-        Canvas canvas = new Canvas(bmp);
-        canvas.drawColor(Color.BLACK);
+    private void drawAlertScreenInternal() {
+        renderCanvas.drawColor(Color.BLACK);
+        paint.reset();
+        paint.setAntiAlias(true);
+        paint.setTextAlign(Paint.Align.CENTER);
 
-        Paint p = new Paint();
-        p.setAntiAlias(true);
-        p.setTextAlign(Paint.Align.CENTER);
-
-        if (!title.isEmpty()) {
-            p.setColor(Color.parseColor(colorHex));
-            p.setTextSize(26);
-            p.setTypeface(Typeface.DEFAULT_BOLD);
-            canvas.drawText(title, 120, 60, p);
+        if (!alertTitle.isEmpty()) {
+            paint.setColor(Color.parseColor(alertColor));
+            paint.setTextSize(26);
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            renderCanvas.drawText(alertTitle, 120, 60, paint);
         }
 
-        p.setColor(Color.WHITE);
-        p.setTextSize(msg.length() > 8 ? 26 : 36);
-        p.setTypeface(Typeface.DEFAULT_BOLD);
-        canvas.drawText(msg, 120, title.isEmpty() ? 120 : 130, p);
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(alertMsg.length() > 8 ? 26 : 36);
+        paint.setTypeface(Typeface.DEFAULT_BOLD);
+        renderCanvas.drawText(alertMsg, 120, alertTitle.isEmpty() ? 120 : 130, paint);
 
-        if (!footer.isEmpty()) {
-            p.setColor(Color.GRAY);
-            p.setTextSize(16);
-            p.setTypeface(Typeface.DEFAULT);
-            canvas.drawText(footer, 120, 190, p);
+        if (!alertFooter.isEmpty()) {
+            paint.setColor(Color.GRAY);
+            paint.setTextSize(16);
+            paint.setTypeface(Typeface.DEFAULT);
+            renderCanvas.drawText(alertFooter, 120, 190, paint);
         }
 
-        renderToFramebuffer(bmp);
+        renderToFramebufferInternal();
     }
 
-    private synchronized void renderToFramebuffer(Bitmap bmp) {
+    // Konwersja bitmapy do formatu RGB565 i zapis do framebuffer /dev/graphics/fb1
+    private void renderToFramebufferInternal() {
         if (!isScreenHardwarePowered) return;
         try {
-            byte[] raw = new byte[240 * 240 * 2];
+            renderBmp.getPixels(pixelArray, 0, 240, 0, 0, 240, 240);
+
             int idx = 0;
             for (int y = 0; y < 240; y++) {
+                int rowOffset = y * 240;
+                // Odwrócenie osi X (ekran gałki ma odwrócone mapowanie poziome)
                 for (int x = 239; x >= 0; x--) {
-                    int p = bmp.getPixel(x, y);
-                    int r = (p >> 16) & 0xFF;
-                    int g = (p >> 8) & 0xFF;
-                    int b = p & 0xFF;
-                    int rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                    int p = pixelArray[rowOffset + x];
+                    int r = (p >> 19) & 0x1F;
+                    int g = (p >> 10) & 0x3F;
+                    int b = (p >> 3) & 0x1F;
+                    int rgb565 = (r << 11) | (g << 5) | b;
 
-                    raw[idx++] = (byte) (rgb565 & 0xFF);
-                    raw[idx++] = (byte) ((rgb565 >> 8) & 0xFF);
+                    rawFbBuffer[idx++] = (byte) (rgb565 & 0xFF);
+                    rawFbBuffer[idx++] = (byte) ((rgb565 >> 8) & 0xFF);
                 }
             }
 
-            File fb = new File("/dev/graphics/fb1");
-            FileOutputStream fos = new FileOutputStream(fb);
-            fos.write(raw);
-            fos.flush();
-            fos.close();
+            if (fbAccessFile != null) {
+                try {
+                    fbAccessFile.seek(0);
+                    fbAccessFile.write(rawFbBuffer);
+                    return;
+                } catch (Exception e) {
+                    try { fbAccessFile.close(); } catch (Exception ignored) {}
+                    fbAccessFile = null;
+                }
+            }
+
+            // Fallback przez ponowne otwarcie strumienia
+            try (FileOutputStream fos = new FileOutputStream("/dev/graphics/fb1")) {
+                fos.write(rawFbBuffer);
+                fos.flush();
+            }
         } catch (Exception ignored) {}
     }
 
@@ -1108,7 +1237,44 @@ public class BridgeService extends Service {
     public void onDestroy() {
         super.onDestroy();
         running = false;
+
+        if (inputMonitoringProc != null) {
+            inputMonitoringProc.destroy();
+            inputMonitoringProc = null;
+        }
+
         try { unregisterReceiver(screenStateReceiver); } catch (Exception ignored) {}
+        try { unregisterReceiver(configReceiver); } catch (Exception ignored) {}
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && audioRecordingCallback != null && audioManager != null) {
+            try { audioManager.unregisterAudioRecordingCallback(audioRecordingCallback); } catch (Exception ignored) {}
+        }
+
+        if (client != null) {
+            try {
+                if (client.isConnected()) client.disconnectForcibly(500);
+                client.close();
+            } catch (Exception ignored) {}
+            client = null;
+        }
+
+        if (ttyOutStream != null) {
+            try { ttyOutStream.close(); } catch (Exception ignored) {}
+            ttyOutStream = null;
+        }
+
+        if (fbAccessFile != null) {
+            try { fbAccessFile.close(); } catch (Exception ignored) {}
+            fbAccessFile = null;
+        }
+
+        if (cachedMediaArt != null) {
+            cachedMediaArt.recycle();
+            cachedMediaArt = null;
+        }
+
+        hwExecutor.shutdownNow();
+
         try {
             if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
             if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
