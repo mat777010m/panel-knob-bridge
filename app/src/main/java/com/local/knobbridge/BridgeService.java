@@ -46,6 +46,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -58,7 +59,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class BridgeService extends Service {
     private static final String TAG = "KnobBridge";
 
-    // Konfiguracja MQTT
+    // Konfiguracja brokera MQTT
     private String brokerUri = "tcp://192.168.0.7:1883";
     private String mqttUser = "admin";
     private String mqttPass = "admin";
@@ -69,25 +70,39 @@ public class BridgeService extends Service {
     private volatile boolean running = true;
     private volatile boolean isConnecting = false;
 
-    // Kolejka operacji sprzętowych (jeden wątek roboczy: ochrona przed race conditions)
+    // Dedykowany jednowątkowy egzekutor dla MQTT (izolacja od Paho i UI)
+    private final ExecutorService mqttExecutor = Executors.newSingleThreadExecutor();
+    // Dedykowany jednowątkowy egzekutor dla operacji sprzętowych (UART, Framebuffer, sysfs)
     private final ExecutorService hwExecutor = Executors.newSingleThreadExecutor();
     private Process inputMonitoringProc;
 
-    // Blokady zasilania i audio
+    // Blokady systemowe
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private AudioManager audioManager;
     private AudioManager.AudioRecordingCallback audioRecordingCallback;
 
-    // Deskryptory I/O sprzętu
+    // Deskryptory I/O
     private FileOutputStream ttyOutStream;
     private RandomAccessFile fbAccessFile;
 
-    // Flagi sprzętowe
+    // Flagi stanu sprzętu
     private boolean isMainScreenOn = true;
     private volatile boolean isScreenHardwarePowered = true;
     private boolean isMicActive = false;
     private boolean isMicMuted = false;
+    private boolean isLedRingOn = false;
+
+    // Zmienne stanów DSP i EQ (do natychmiastowej synchronizacji)
+    private int dspZ1Master = 15;
+    private int dspZ1Left = 12;
+    private int dspZ1Right = 12;
+    private int dspZ2Master = 15;
+    private int dspZ2Left = 12;
+    private int dspZ2Right = 12;
+    private int dspEqBass = 0;
+    private int dspEqTreble = 0;
+    private String dspEqMode = "Standard";
 
     // Alerty
     private boolean hasUnreadAlert = false;
@@ -98,7 +113,7 @@ public class BridgeService extends Service {
     private String alertFooter = "";
     private String alertColor = "#FF3D00";
 
-    // Tryby pracy
+    // Tryby wyświetlacza
     private enum ScreenMode { CLOCK, GAUGE, MENU, MEDIA, ALERT }
     private ScreenMode currentMode = ScreenMode.CLOCK;
 
@@ -128,7 +143,7 @@ public class BridgeService extends Service {
     private int mediaProgress = -1;
     private Bitmap cachedMediaArt = null;
 
-    // ZERO-ALLOCATION BUFFERY (240x240 RGB565)
+    // Zero-allocation buffery (240x240 RGB565)
     private final Bitmap renderBmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
     private final Canvas renderCanvas = new Canvas(renderBmp);
     private final int[] pixelArray = new int[240 * 240];
@@ -139,7 +154,6 @@ public class BridgeService extends Service {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint tickPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-    // Tablica stałych współrzędnych 19 kresek tarczy wskaźnika
     private static final float[] TICK_COORDS = new float[19 * 4];
     static {
         int idx = 0;
@@ -185,7 +199,7 @@ public class BridgeService extends Service {
             if (intent.hasExtra("topic")) ed.putString("topic", intent.getStringExtra("topic"));
             ed.apply();
             loadConfig();
-            restartMqtt();
+            scheduleMqttConnect();
         }
     };
 
@@ -215,7 +229,7 @@ public class BridgeService extends Service {
 
         initHardware();
         startRootInputMonitoring();
-        startMqtt();
+        scheduleMqttConnect();
     }
 
     private void acquireLocks() {
@@ -261,7 +275,467 @@ public class BridgeService extends Service {
         this.baseTopic = prefs.getString("topic", this.baseTopic);
     }
 
-    // --- STEROWANIE SPRZĘTEM ---
+    // --- ARCHITEKTURA MQTT BEZ BLOKOWANIA ---
+    private void scheduleMqttConnect() {
+        if (mqttExecutor.isShutdown()) return;
+        mqttExecutor.execute(this::connectMqttInternal);
+    }
+
+    private void connectMqttInternal() {
+        if (isConnecting || (client != null && client.isConnected())) return;
+        isConnecting = true;
+
+        try {
+            if (client != null) {
+                try { client.disconnectForcibly(500); client.close(); } catch (Exception ignored) {}
+                client = null;
+            }
+
+            String androidId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+            if (androidId == null || androidId.isEmpty()) androidId = "a133_panel";
+            String clientId = "PanelKnobEngine_" + androidId;
+
+            client = new MqttClient(brokerUri, clientId, new MemoryPersistence());
+            MqttConnectOptions opts = new MqttConnectOptions();
+            opts.setCleanSession(true);
+            opts.setAutomaticReconnect(true);
+            opts.setKeepAliveInterval(60);
+            opts.setConnectionTimeout(15);
+            opts.setMaxInflight(100);
+            if (!mqttUser.isEmpty()) {
+                opts.setUserName(mqttUser);
+                opts.setPassword(mqttPass.toCharArray());
+            }
+
+            client.setCallback(new MqttCallbackExtended() {
+                @Override
+                public void connectComplete(boolean reconnect, String serverURI) {
+                    Log.i(TAG, "MQTT połączone (reconnect=" + reconnect + "). Kolejkuję discovery i stany...");
+                    // BŁYSKAWICZNY RETURN: Przenosimy rejestrację do mqttExecutor, zwalniając wątek Paho
+                    mqttExecutor.execute(() -> {
+                        subscribeTopicsInternal();
+                        publishHomeAssistantDiscoveryInternal();
+                        syncAllStatesInternal();
+                    });
+                }
+
+                @Override
+                public void connectionLost(Throwable cause) {
+                    Log.w(TAG, "MQTT utracone: " + (cause != null ? cause.getMessage() : "brak przyczyny"));
+                }
+
+                @Override
+                public void messageArrived(String topic, MqttMessage message) {
+                    String payload = new String(message.getPayload(), StandardCharsets.UTF_8).trim();
+                    handleIncomingMqtt(topic, payload);
+                }
+
+                @Override
+                public void deliveryComplete(IMqttDeliveryToken token) {}
+            });
+
+            Log.i(TAG, "Łączenie z brokerem " + brokerUri + " jako " + clientId);
+            client.connect(opts);
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd łączenia z MQTT (" + e.getMessage() + "), ponawiam za 5s...");
+            handler.postDelayed(this::scheduleMqttConnect, 5000);
+        } finally {
+            isConnecting = false;
+        }
+    }
+
+    private void subscribeTopicsInternal() {
+        try {
+            if (client != null && client.isConnected()) {
+                client.subscribe(new String[]{
+                        baseTopic + "/display/#",
+                        baseTopic + "/led/#",
+                        baseTopic + "/dsp/#",
+                        baseTopic + "/mic/#"
+                }, new int[]{0, 0, 0, 0});
+                Log.i(TAG, "Zasubskrybowano topiki sterujące.");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd subskrypcji: " + e.getMessage());
+        }
+    }
+
+    // Bezpieczny, nieblokujący publish trafiający do kolejki roboczej MQTT
+    private void publishRaw(String topic, String payload, boolean retained) {
+        if (mqttExecutor.isShutdown()) return;
+        mqttExecutor.execute(() -> publishRawInternal(topic, payload, retained));
+    }
+
+    // Wewnętrzna metoda wykonująca faktyczny zapis do gniazda MQTT z QoS 0 (natychmiastowe wysłanie bez czekania na ACK)
+    private void publishRawInternal(String topic, String payload, boolean retained) {
+        try {
+            if (client != null && client.isConnected()) {
+                MqttMessage msg = new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
+                msg.setQos(0);
+                msg.setRetained(retained);
+                client.publish(topic, msg);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd wysyłki (" + topic + "): " + e.getMessage());
+        }
+    }
+
+    private void publishHomeAssistantDiscoveryInternal() {
+        try {
+            JSONObject device = new JSONObject();
+            device.put("identifiers", new JSONArray().put("panel_knob_engine_v4"));
+            device.put("name", "Gałka Panel");
+            device.put("model", "Allwinner DSP Knob 240x240");
+            device.put("manufacturer", "Smart Home Lab");
+
+            // 1. Zdarzenie Gałki (Event)
+            JSONObject ev = new JSONObject();
+            ev.put("name", "Zdarzenie Gałki");
+            ev.put("unique_id", "knob_event_trigger_v4");
+            ev.put("state_topic", baseTopic + "/knob/event");
+            ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
+            ev.put("device", device);
+            publishRawInternal("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
+
+            // 2. Akcja Gałki (Sensor tekstu)
+            JSONObject act = new JSONObject();
+            act.put("name", "Akcja Gałki");
+            act.put("unique_id", "knob_action_sensor_v4");
+            act.put("state_topic", baseTopic + "/knob/action");
+            act.put("force_update", true);
+            act.put("icon", "mdi:rotate-right");
+            act.put("device", device);
+            publishRawInternal("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
+
+            // 3. Zatwierdzona Wartość (Sensor)
+            JSONObject conf = new JSONObject();
+            conf.put("name", "Zatwierdzona Wartość");
+            conf.put("unique_id", "knob_confirm_val_v4");
+            conf.put("state_topic", baseTopic + "/knob/confirm");
+            conf.put("icon", "mdi:check-circle-outline");
+            conf.put("device", device);
+            publishRawInternal("homeassistant/sensor/panel_knob/confirm/config", conf.toString(), true);
+
+            // 4. Zasilanie Ekraniku (Switch)
+            JSONObject pwr = new JSONObject();
+            pwr.put("name", "Zasilanie Ekraniku");
+            pwr.put("unique_id", "knob_power_switch_v4");
+            pwr.put("command_topic", baseTopic + "/display/power");
+            pwr.put("state_topic", baseTopic + "/display/state");
+            pwr.put("payload_on", "on");
+            pwr.put("payload_off", "off");
+            pwr.put("icon", "mdi:power");
+            pwr.put("device", device);
+            publishRawInternal("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
+
+            // 5. Pierścień LED (Switch)
+            JSONObject led = new JSONObject();
+            led.put("name", "Pierścień LED");
+            led.put("unique_id", "knob_led_ring_v4");
+            led.put("command_topic", baseTopic + "/led/set");
+            led.put("state_topic", baseTopic + "/led/state");
+            led.put("payload_on", "on");
+            led.put("payload_off", "off");
+            led.put("icon", "mdi:led-strip-variant");
+            led.put("device", device);
+            publishRawInternal("homeassistant/switch/panel_knob/led_ring/config", led.toString(), true);
+
+            // 6. Wyciszenie Mikrofonu (Switch)
+            JSONObject micM = new JSONObject();
+            micM.put("name", "Wyciszenie Mikrofonu");
+            micM.put("unique_id", "knob_mic_mute_v4");
+            micM.put("command_topic", baseTopic + "/mic/mute/set");
+            micM.put("state_topic", baseTopic + "/mic/mute/state");
+            micM.put("payload_on", "ON");
+            micM.put("payload_off", "OFF");
+            micM.put("icon", "mdi:microphone-off");
+            micM.put("device", device);
+            publishRawInternal("homeassistant/switch/panel_knob/mic_mute/config", micM.toString(), true);
+
+            // 7. Mikrofon Używany (Binary Sensor)
+            JSONObject micA = new JSONObject();
+            micA.put("name", "Mikrofon Używany");
+            micA.put("unique_id", "knob_mic_active_v4");
+            micA.put("state_topic", baseTopic + "/mic/active/state");
+            micA.put("payload_on", "ON");
+            micA.put("payload_off", "OFF");
+            micA.put("icon", "mdi:microphone");
+            micA.put("device", device);
+            publishRawInternal("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
+
+            // 8. DSP Strefa 1 (Number Sliders)
+            registerNumberInternal("dsp_z1_master", "Strefa 1 Głośność Główna", baseTopic + "/dsp/z1/master", 0, 20, "mdi:volume-high", device);
+            registerNumberInternal("dsp_z1_left", "Strefa 1 Głośnik Lewy", baseTopic + "/dsp/z1/left", 0, 20, "mdi:speaker", device);
+            registerNumberInternal("dsp_z1_right", "Strefa 1 Głośnik Prawy", baseTopic + "/dsp/z1/right", 0, 20, "mdi:speaker", device);
+
+            // 9. DSP Strefa 2 (Number Sliders)
+            registerNumberInternal("dsp_z2_master", "Strefa 2 Głośność Główna", baseTopic + "/dsp/z2/master", 0, 20, "mdi:volume-high", device);
+            registerNumberInternal("dsp_z2_left", "Strefa 2 Głośnik Lewy", baseTopic + "/dsp/z2/left", 0, 20, "mdi:speaker", device);
+            registerNumberInternal("dsp_z2_right", "Strefa 2 Głośnik Prawy", baseTopic + "/dsp/z2/right", 0, 20, "mdi:speaker", device);
+
+            // 10. DSP EQ (Basy, Soprany, Profil)
+            registerNumberInternal("dsp_eq_bass", "Korektor Basy", baseTopic + "/dsp/eq/bass", -10, 10, "mdi:equalizer", device);
+            registerNumberInternal("dsp_eq_treble", "Korektor Soprany", baseTopic + "/dsp/eq/treble", -10, 10, "mdi:equalizer", device);
+
+            JSONObject eqProf = new JSONObject();
+            eqProf.put("name", "Profil Dźwięku EQ");
+            eqProf.put("unique_id", "knob_dsp_eq_mode_v4");
+            eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
+            eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
+            eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
+            eqProf.put("icon", "mdi:music-box-outline");
+            eqProf.put("device", device);
+            publishRawInternal("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
+
+            Log.i(TAG, "Discovery HA pomyślnie wysłane (16 encji).");
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd generowania discovery: " + e.getMessage());
+        }
+    }
+
+    private void registerNumberInternal(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) {
+        try {
+            JSONObject obj = new JSONObject();
+            obj.put("name", name);
+            obj.put("unique_id", "knob_" + id + "_v4");
+            obj.put("command_topic", topicPrefix + "/set");
+            obj.put("state_topic", topicPrefix + "/state");
+            obj.put("min", min);
+            obj.put("max", max);
+            obj.put("step", 1);
+            obj.put("mode", "slider");
+            obj.put("icon", icon);
+            obj.put("device", device);
+            publishRawInternal("homeassistant/number/panel_knob/" + id + "/config", obj.toString(), true);
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd rejestracji suwaka " + id + ": " + e.getMessage());
+        }
+    }
+
+    private void syncAllStatesInternal() {
+        publishRawInternal(baseTopic + "/dsp/z1/master/state", String.valueOf(dspZ1Master), true);
+        publishRawInternal(baseTopic + "/dsp/z1/left/state", String.valueOf(dspZ1Left), true);
+        publishRawInternal(baseTopic + "/dsp/z1/right/state", String.valueOf(dspZ1Right), true);
+        publishRawInternal(baseTopic + "/dsp/z2/master/state", String.valueOf(dspZ2Master), true);
+        publishRawInternal(baseTopic + "/dsp/z2/left/state", String.valueOf(dspZ2Left), true);
+        publishRawInternal(baseTopic + "/dsp/z2/right/state", String.valueOf(dspZ2Right), true);
+        publishRawInternal(baseTopic + "/dsp/eq/bass/state", String.valueOf(dspEqBass), true);
+        publishRawInternal(baseTopic + "/dsp/eq/treble/state", String.valueOf(dspEqTreble), true);
+        publishRawInternal(baseTopic + "/dsp/eq/mode/state", dspEqMode, true);
+        publishRawInternal(baseTopic + "/display/state", isScreenHardwarePowered ? "on" : "off", true);
+        publishRawInternal(baseTopic + "/led/state", isLedRingOn ? "on" : "off", true);
+        publishRawInternal(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
+        publishRawInternal(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
+        Log.i(TAG, "Zsynchronizowano stany początkowe z HA.");
+    }
+
+    private int parseClampedInt(String payload, int min, int max, int defaultVal) {
+        if (payload == null || payload.isEmpty()) return defaultVal;
+        try {
+            double d = Double.parseDouble(payload.trim());
+            int val = (int) Math.round(d);
+            return Math.max(min, Math.min(max, val));
+        } catch (Exception e) {
+            return defaultVal;
+        }
+    }
+
+    private void handleIncomingMqtt(String topic, String payload) {
+        try {
+            if (topic.equals(baseTopic + "/mic/mute/set")) {
+                setMicrophoneMute("ON".equalsIgnoreCase(payload) || "true".equalsIgnoreCase(payload));
+                return;
+            }
+
+            // DSP Strefa 1
+            if (topic.equals(baseTopic + "/dsp/z1/master/set")) {
+                dspZ1Master = parseClampedInt(payload, 0, 20, 15);
+                sendDspFrame(0xA1, dspZ1Master, 1);
+                publishRaw(baseTopic + "/dsp/z1/master/state", String.valueOf(dspZ1Master), true);
+                return;
+            }
+            if (topic.equals(baseTopic + "/dsp/z1/left/set")) {
+                dspZ1Left = parseClampedInt(payload, 0, 20, 12);
+                sendDspFrame(0xAE, dspZ1Left, 1);
+                publishRaw(baseTopic + "/dsp/z1/left/state", String.valueOf(dspZ1Left), true);
+                return;
+            }
+            if (topic.equals(baseTopic + "/dsp/z1/right/set")) {
+                dspZ1Right = parseClampedInt(payload, 0, 20, 12);
+                sendDspFrame(0xAF, dspZ1Right, 1);
+                publishRaw(baseTopic + "/dsp/z1/right/state", String.valueOf(dspZ1Right), true);
+                return;
+            }
+
+            // DSP Strefa 2
+            if (topic.equals(baseTopic + "/dsp/z2/master/set")) {
+                dspZ2Master = parseClampedInt(payload, 0, 20, 15);
+                sendDspFrame(0xA1, dspZ2Master, 2);
+                publishRaw(baseTopic + "/dsp/z2/master/state", String.valueOf(dspZ2Master), true);
+                return;
+            }
+            if (topic.equals(baseTopic + "/dsp/z2/left/set")) {
+                dspZ2Left = parseClampedInt(payload, 0, 20, 12);
+                sendDspFrame(0xAE, dspZ2Left, 2);
+                publishRaw(baseTopic + "/dsp/z2/left/state", String.valueOf(dspZ2Left), true);
+                return;
+            }
+            if (topic.equals(baseTopic + "/dsp/z2/right/set")) {
+                dspZ2Right = parseClampedInt(payload, 0, 20, 12);
+                sendDspFrame(0xAF, dspZ2Right, 2);
+                publishRaw(baseTopic + "/dsp/z2/right/state", String.valueOf(dspZ2Right), true);
+                return;
+            }
+
+            // DSP EQ
+            if (topic.equals(baseTopic + "/dsp/eq/bass/set")) {
+                dspEqBass = parseClampedInt(payload, -10, 10, 0);
+                int hex = 0xA0 + dspEqBass;
+                sendDspFrame(0xAB, hex, 1);
+                sendDspFrame(0xAB, hex, 2);
+                publishRaw(baseTopic + "/dsp/eq/bass/state", String.valueOf(dspEqBass), true);
+                return;
+            }
+            if (topic.equals(baseTopic + "/dsp/eq/treble/set")) {
+                dspEqTreble = parseClampedInt(payload, -10, 10, 0);
+                int hex = 0xA0 + dspEqTreble;
+                sendDspFrame(0xAC, hex, 1);
+                sendDspFrame(0xAC, hex, 2);
+                publishRaw(baseTopic + "/dsp/eq/treble/state", String.valueOf(dspEqTreble), true);
+                return;
+            }
+            if (topic.equals(baseTopic + "/dsp/eq/mode/set")) {
+                int modeVal;
+                switch (payload.trim().toLowerCase(Locale.ROOT)) {
+                    case "pop": modeVal = 2; dspEqMode = "Pop"; break;
+                    case "rock": modeVal = 3; dspEqMode = "Rock"; break;
+                    case "classic": modeVal = 4; dspEqMode = "Classic"; break;
+                    case "jazz": modeVal = 5; dspEqMode = "Jazz"; break;
+                    case "vocal": modeVal = 6; dspEqMode = "Vocal"; break;
+                    default: modeVal = 1; dspEqMode = "Standard"; break;
+                }
+                sendDspFrame(0xA2, modeVal, 1);
+                sendDspFrame(0xA2, modeVal, 2);
+                publishRaw(baseTopic + "/dsp/eq/mode/state", dspEqMode, true);
+                return;
+            }
+
+            if (topic.equals(baseTopic + "/display/power")) {
+                setHardwarePower("on".equalsIgnoreCase(payload));
+                if (isScreenHardwarePowered) redrawCurrentScreen();
+                return;
+            }
+            if (topic.equals(baseTopic + "/led/set")) {
+                isLedRingOn = "on".equalsIgnoreCase(payload);
+                setLedRingHardware(isLedRingOn);
+                return;
+            }
+
+            if (topic.equals(baseTopic + "/display/alert/clear")) {
+                hasUnreadAlert = false;
+                alertBadgeText = "";
+                isAlertKeepingAwake = false;
+                returnToClock();
+                if (!isMainScreenOn) setHardwarePower(false);
+                return;
+            }
+
+            if (topic.equals(baseTopic + "/display/gauge")) {
+                JSONObject j = new JSONObject(payload);
+                gaugeTitle = j.optString("title", "");
+                gaugeFooter = j.optString("footer", "");
+                gaugeValue = j.optInt("value", 50);
+                gaugeMin = j.optInt("min", 0);
+                gaugeMax = j.optInt("max", 100);
+                gaugeStep = j.optInt("step", 5);
+                gaugeUnit = j.optString("unit", "%");
+                gaugeColor = Color.parseColor(j.optString("color", "#00E5FF"));
+
+                currentMode = ScreenMode.GAUGE;
+                ensureScreenAwake();
+                animateGaugeToValue(gaugeValue);
+                resetTimeout(j.optInt("timeout", 5000));
+                return;
+            }
+
+            if (topic.equals(baseTopic + "/display/menu")) {
+                JSONObject j = new JSONObject(payload);
+                menuTitle = j.optString("title", "");
+                menuFooter = j.optString("footer", "");
+                menuItems.clear();
+                JSONArray arr = j.optJSONArray("items");
+                if (arr != null) {
+                    for (int i = 0; i < arr.length(); i++) menuItems.add(arr.getString(i));
+                }
+                menuIndex = Math.max(0, Math.min(menuItems.size() - 1, j.optInt("selected_index", 0)));
+
+                currentMode = ScreenMode.MENU;
+                ensureScreenAwake();
+                postRenderTask(this::drawMenuScreenInternal);
+                resetTimeout(j.optInt("timeout", 5000));
+                return;
+            }
+
+            if (topic.equals(baseTopic + "/display/media")) {
+                JSONObject j = new JSONObject(payload);
+                mediaHeader = j.optString("header", "");
+                mediaTitle = j.optString("title", "");
+                mediaSub = j.optString("sub", j.optString("artist", ""));
+                mediaProgress = j.optInt("progress", -1);
+
+                String b64 = j.optString("image_base64", "");
+                if (!b64.isEmpty()) {
+                    try {
+                        byte[] raw = Base64.decode(b64, Base64.DEFAULT);
+                        BitmapFactory.Options opts = new BitmapFactory.Options();
+                        opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                        Bitmap decoded = BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+                        if (decoded != null) {
+                            if (cachedMediaArt != null) cachedMediaArt.recycle();
+                            cachedMediaArt = decoded;
+                        }
+                    } catch (Exception ignored) {}
+                }
+
+                currentMode = ScreenMode.MEDIA;
+                ensureScreenAwake();
+                postRenderTask(this::drawMediaScreenInternal);
+                resetTimeout(j.optInt("timeout", 10000));
+                return;
+            }
+
+            if (topic.equals(baseTopic + "/display/alert")) {
+                JSONObject j = new JSONObject(payload);
+                alertTitle = j.optString("title", "");
+                alertMsg = j.optString("text", "");
+                alertFooter = j.optString("footer", "");
+                alertColor = j.optString("color", "#FF3D00");
+                boolean keepAwake = j.optBoolean("keep_awake", false);
+                boolean setBadge = j.optBoolean("badge", false);
+
+                if (setBadge) {
+                    hasUnreadAlert = true;
+                    alertBadgeText = alertTitle.isEmpty() ? "ALERT" : alertTitle;
+                }
+                isAlertKeepingAwake = keepAwake;
+
+                currentMode = ScreenMode.ALERT;
+                setHardwarePower(true);
+                postRenderTask(this::drawAlertScreenInternal);
+
+                if (!keepAwake) resetTimeout(j.optInt("duration", 4000));
+                else handler.removeCallbacks(timeoutCancelTask);
+                return;
+            }
+
+            if (topic.equals(baseTopic + "/display/clock")) {
+                returnToClock();
+            }
+
+        } catch (Exception ignored) {}
+    }
+
+    // --- SPRZĘT: UART / SYSFS / FB ---
     private void initHardware() {
         hwExecutor.execute(() -> {
             runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && " +
@@ -270,22 +744,22 @@ public class BridgeService extends Service {
             try {
                 ttyOutStream = new FileOutputStream(new File("/dev/ttyAS4"));
             } catch (Exception e) {
-                Log.w(TAG, "Bezpośrednie otwarcie TTY nie powiodło się");
+                Log.w(TAG, "Brak bezpośredniego dostępu do TTY: " + e.getMessage());
             }
 
             try {
                 fbAccessFile = new RandomAccessFile("/dev/graphics/fb1", "rw");
             } catch (Exception e) {
-                Log.w(TAG, "Bezpośrednie otwarcie FB1 nie powiodło się");
+                Log.w(TAG, "Brak bezpośredniego dostępu do FB1: " + e.getMessage());
             }
 
-            // Inicjalizacja domyślnego poziomu DSP
-            sendDspFrameSync(0xA1, 15, 1);
-            sendDspFrameSync(0xAE, 12, 1);
-            sendDspFrameSync(0xAF, 12, 1);
-            sendDspFrameSync(0xA1, 15, 2);
-            sendDspFrameSync(0xAE, 12, 2);
-            sendDspFrameSync(0xAF, 12, 2);
+            // Inicjalizacja wzmacniacza DSP YDA
+            sendDspFrameSync(0xA1, dspZ1Master, 1);
+            sendDspFrameSync(0xAE, dspZ1Left, 1);
+            sendDspFrameSync(0xAF, dspZ1Right, 1);
+            sendDspFrameSync(0xA1, dspZ2Master, 2);
+            sendDspFrameSync(0xAE, dspZ2Left, 2);
+            sendDspFrameSync(0xAF, dspZ2Right, 2);
             sendDspFrameSync(0xAB, 0xA0, 1);
             sendDspFrameSync(0xAC, 0xA0, 1);
 
@@ -323,7 +797,7 @@ public class BridgeService extends Service {
 
     private void writeSysFs(String path, String value) {
         try (FileOutputStream fos = new FileOutputStream(path)) {
-            fos.write(value.getBytes());
+            fos.write(value.getBytes(StandardCharsets.UTF_8));
             fos.flush();
         } catch (Exception e) {
             runRootCmdSync("echo " + value + " > " + path);
@@ -522,465 +996,6 @@ public class BridgeService extends Service {
         if (isScreenHardwarePowered) postRenderTask(this::drawClockInternal);
     }
 
-    // --- OBSŁUGA MQTT ---
-    private synchronized void startMqtt() {
-        if (isConnecting || (client != null && client.isConnected())) return;
-        isConnecting = true;
-
-        new Thread(() -> {
-            try {
-                if (client != null) {
-                    try { client.disconnectForcibly(1000); client.close(); } catch (Exception ignored) {}
-                    client = null;
-                }
-
-                String androidId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
-                if (androidId == null || androidId.isEmpty()) androidId = "panel_knob_01";
-                String clientId = "PanelKnobEngine_" + androidId;
-
-                client = new MqttClient(brokerUri, clientId, new MemoryPersistence());
-                MqttConnectOptions opts = new MqttConnectOptions();
-                opts.setCleanSession(true);
-                opts.setAutomaticReconnect(true);
-                opts.setKeepAliveInterval(60);
-                opts.setConnectionTimeout(30);
-                opts.setMaxInflight(100);
-                if (!mqttUser.isEmpty()) {
-                    opts.setUserName(mqttUser);
-                    opts.setPassword(mqttPass.toCharArray());
-                }
-
-                client.setCallback(new MqttCallbackExtended() {
-                    @Override
-                    public void connectComplete(boolean reconnect, String serverURI) {
-                        Log.i(TAG, "MQTT połączone. Rejestruję encje...");
-                        subscribeTopics();
-                        publishHomeAssistantDiscovery();
-                        publishRaw(baseTopic + "/mic/mute/state", isMicMuted ? "ON" : "OFF", true);
-                        publishRaw(baseTopic + "/mic/active/state", isMicActive ? "ON" : "OFF", true);
-                    }
-
-                    @Override
-                    public void connectionLost(Throwable cause) {
-                        Log.w(TAG, "MQTT utracone. Paho ponowi próbę w tle...");
-                    }
-
-                    @Override
-                    public void messageArrived(String topic, MqttMessage message) {
-                        handleIncomingMqtt(topic, new String(message.getPayload()).trim());
-                    }
-
-                    @Override
-                    public void deliveryComplete(IMqttDeliveryToken token) {}
-                });
-
-                client.connect(opts);
-            } catch (Exception e) {
-                Log.e(TAG, "Błąd łączenia z MQTT (" + e.getMessage() + "), ponawiam za 5s...");
-                handler.postDelayed(BridgeService.this::startMqtt, 5000);
-            } finally {
-                isConnecting = false;
-            }
-        }, "MqttConnectThread").start();
-    }
-
-    private void restartMqtt() {
-        if (client != null) {
-            try { client.disconnectForcibly(500); client.close(); } catch (Exception ignored) {}
-            client = null;
-        }
-        startMqtt();
-    }
-
-    private void subscribeTopics() {
-        try {
-            if (client != null && client.isConnected()) {
-                client.subscribe(new String[]{
-                        baseTopic + "/display/#",
-                        baseTopic + "/led/#",
-                        baseTopic + "/dsp/#",
-                        baseTopic + "/mic/#"
-                }, new int[]{0, 0, 0, 0});
-            }
-        } catch (Exception ignored) {}
-    }
-
-    private void publishRaw(String topic, String payload, boolean retained) {
-        try {
-            if (client != null && client.isConnected()) {
-                MqttMessage msg = new MqttMessage(payload.getBytes());
-                msg.setQos(retained ? 1 : 0);
-                msg.setRetained(retained);
-                client.publish(topic, msg);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd wysyłki na topic " + topic + ": " + e.getMessage());
-        }
-    }
-
-    private void publishHomeAssistantDiscovery() {
-        try {
-            JSONObject device = new JSONObject();
-            device.put("identifiers", new JSONArray().put("panel_knob_engine_v4"));
-            device.put("name", "Gałka Panel");
-            device.put("model", "Allwinner DSP Knob 240x240");
-            device.put("manufacturer", "Smart Home Lab");
-
-            // Event Gałki
-            try {
-                JSONObject ev = new JSONObject();
-                ev.put("name", "Zdarzenie Gałki");
-                ev.put("unique_id", "knob_event_trigger_v4");
-                ev.put("state_topic", baseTopic + "/knob/event");
-                ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
-                ev.put("device", device);
-                publishRaw("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err EV: " + e.getMessage()); }
-
-            // Sensor Akcji
-            try {
-                JSONObject act = new JSONObject();
-                act.put("name", "Akcja Gałki");
-                act.put("unique_id", "knob_action_sensor_v4");
-                act.put("state_topic", baseTopic + "/knob/action");
-                act.put("force_update", true);
-                act.put("icon", "mdi:rotate-right");
-                act.put("device", device);
-                publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err ACT: " + e.getMessage()); }
-
-            // Sensor Potwierdzenia
-            try {
-                JSONObject conf = new JSONObject();
-                conf.put("name", "Zatwierdzona Wartość");
-                conf.put("unique_id", "knob_confirm_val_v4");
-                conf.put("state_topic", baseTopic + "/knob/confirm");
-                conf.put("icon", "mdi:check-circle-outline");
-                conf.put("device", device);
-                publishRaw("homeassistant/sensor/panel_knob/confirm/config", conf.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err CONF: " + e.getMessage()); }
-
-            // Switch Zasilania Ekraniku
-            try {
-                JSONObject pwr = new JSONObject();
-                pwr.put("name", "Zasilanie Ekraniku");
-                pwr.put("unique_id", "knob_power_switch_v4");
-                pwr.put("command_topic", baseTopic + "/display/power");
-                pwr.put("state_topic", baseTopic + "/display/state");
-                pwr.put("payload_on", "on");
-                pwr.put("payload_off", "off");
-                pwr.put("icon", "mdi:power");
-                pwr.put("device", device);
-                publishRaw("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err PWR: " + e.getMessage()); }
-
-            // Switch Pierścienia LED
-            try {
-                JSONObject led = new JSONObject();
-                led.put("name", "Pierścień LED");
-                led.put("unique_id", "knob_led_ring_v4");
-                led.put("command_topic", baseTopic + "/led/set");
-                led.put("state_topic", baseTopic + "/led/state");
-                led.put("payload_on", "on");
-                led.put("payload_off", "off");
-                led.put("icon", "mdi:led-strip-variant");
-                led.put("device", device);
-                publishRaw("homeassistant/switch/panel_knob/led_ring/config", led.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err LED: " + e.getMessage()); }
-
-            // Switch Wyciszenia Mikrofonu
-            try {
-                JSONObject micM = new JSONObject();
-                micM.put("name", "Wyciszenie Mikrofonu");
-                micM.put("unique_id", "knob_mic_mute_v4");
-                micM.put("command_topic", baseTopic + "/mic/mute/set");
-                micM.put("state_topic", baseTopic + "/mic/mute/state");
-                micM.put("payload_on", "ON");
-                micM.put("payload_off", "OFF");
-                micM.put("icon", "mdi:microphone-off");
-                micM.put("device", device);
-                publishRaw("homeassistant/switch/panel_knob/mic_mute/config", micM.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err MICM: " + e.getMessage()); }
-
-            // Binary Sensor Mikrofon Używany
-            try {
-                JSONObject micA = new JSONObject();
-                micA.put("name", "Mikrofon Używany");
-                micA.put("unique_id", "knob_mic_active_v4");
-                micA.put("state_topic", baseTopic + "/mic/active/state");
-                micA.put("payload_on", "ON");
-                micA.put("payload_off", "OFF");
-                micA.put("icon", "mdi:microphone");
-                micA.put("device", device);
-                publishRaw("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err MICA: " + e.getMessage()); }
-
-            // DSP Strefa 1 i 2
-            registerNumberEntity("dsp_z1_master", "Strefa 1 Głośność Główna", baseTopic + "/dsp/z1/master", 0, 20, "mdi:volume-high", device);
-            registerNumberEntity("dsp_z1_left", "Strefa 1 Głośnik Lewy", baseTopic + "/dsp/z1/left", 0, 20, "mdi:speaker", device);
-            registerNumberEntity("dsp_z1_right", "Strefa 1 Głośnik Prawy", baseTopic + "/dsp/z1/right", 0, 20, "mdi:speaker", device);
-            registerNumberEntity("dsp_z2_master", "Strefa 2 Głośność Główna", baseTopic + "/dsp/z2/master", 0, 20, "mdi:volume-high", device);
-            registerNumberEntity("dsp_z2_left", "Strefa 2 Głośnik Lewy", baseTopic + "/dsp/z2/left", 0, 20, "mdi:speaker", device);
-            registerNumberEntity("dsp_z2_right", "Strefa 2 Głośnik Prawy", baseTopic + "/dsp/z2/right", 0, 20, "mdi:speaker", device);
-
-            // DSP Korektor EQ
-            registerNumberEntity("dsp_eq_bass", "Korektor Basy", baseTopic + "/dsp/eq/bass", -10, 10, "mdi:equalizer", device);
-            registerNumberEntity("dsp_eq_treble", "Korektor Soprany", baseTopic + "/dsp/eq/treble", -10, 10, "mdi:equalizer", device);
-
-            // Wybór Profilu EQ
-            try {
-                JSONObject eqProf = new JSONObject();
-                eqProf.put("name", "Profil Dźwięku EQ");
-                eqProf.put("unique_id", "knob_dsp_eq_mode_v4");
-                eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
-                eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
-                eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
-                eqProf.put("icon", "mdi:music-box-outline");
-                eqProf.put("device", device);
-                publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
-            } catch (Exception e) { Log.e(TAG, "Err EQPROF: " + e.getMessage()); }
-
-            // Publikacja stanów domyślnych
-            publishRaw(baseTopic + "/dsp/z1/master/state", "15", true);
-            publishRaw(baseTopic + "/dsp/z1/left/state", "12", true);
-            publishRaw(baseTopic + "/dsp/z1/right/state", "12", true);
-            publishRaw(baseTopic + "/dsp/z2/master/state", "15", true);
-            publishRaw(baseTopic + "/dsp/z2/left/state", "12", true);
-            publishRaw(baseTopic + "/dsp/z2/right/state", "12", true);
-            publishRaw(baseTopic + "/dsp/eq/bass/state", "0", true);
-            publishRaw(baseTopic + "/dsp/eq/treble/state", "0", true);
-            publishRaw(baseTopic + "/dsp/eq/mode/state", "Standard", true);
-
-            Log.i(TAG, "Discovery HA zakończone pomyślnie.");
-        } catch (Exception e) {
-            Log.e(TAG, "Główny błąd discovery: " + e.getMessage());
-        }
-    }
-
-    private void registerNumberEntity(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) {
-        try {
-            JSONObject obj = new JSONObject();
-            obj.put("name", name);
-            obj.put("unique_id", "knob_" + id + "_v4");
-            obj.put("command_topic", topicPrefix + "/set");
-            obj.put("state_topic", topicPrefix + "/state");
-            obj.put("min", min);
-            obj.put("max", max);
-            obj.put("mode", "slider");
-            obj.put("icon", icon);
-            obj.put("device", device);
-            publishRaw("homeassistant/number/panel_knob/" + id + "/config", obj.toString(), true);
-        } catch (Exception e) {
-            Log.e(TAG, "Błąd rejestracji suwaka " + id + ": " + e.getMessage());
-        }
-    }
-
-    private int parseClampedInt(String payload, int min, int max, int defaultVal) {
-        if (payload == null || payload.isEmpty()) return defaultVal;
-        try {
-            double d = Double.parseDouble(payload.trim());
-            int val = (int) Math.round(d);
-            return Math.max(min, Math.min(max, val));
-        } catch (Exception e) {
-            return defaultVal;
-        }
-    }
-
-    private void handleIncomingMqtt(String topic, String payload) {
-        try {
-            if (topic.equals(baseTopic + "/mic/mute/set")) {
-                setMicrophoneMute("ON".equalsIgnoreCase(payload) || "true".equalsIgnoreCase(payload));
-                return;
-            }
-
-            // DSP Strefa 1
-            if (topic.equals(baseTopic + "/dsp/z1/master/set")) {
-                int val = parseClampedInt(payload, 0, 20, 15);
-                sendDspFrame(0xA1, val, 1);
-                publishRaw(baseTopic + "/dsp/z1/master/state", String.valueOf(val), true);
-                return;
-            }
-            if (topic.equals(baseTopic + "/dsp/z1/left/set")) {
-                int val = parseClampedInt(payload, 0, 20, 12);
-                sendDspFrame(0xAE, val, 1);
-                publishRaw(baseTopic + "/dsp/z1/left/state", String.valueOf(val), true);
-                return;
-            }
-            if (topic.equals(baseTopic + "/dsp/z1/right/set")) {
-                int val = parseClampedInt(payload, 0, 20, 12);
-                sendDspFrame(0xAF, val, 1);
-                publishRaw(baseTopic + "/dsp/z1/right/state", String.valueOf(val), true);
-                return;
-            }
-
-            // DSP Strefa 2
-            if (topic.equals(baseTopic + "/dsp/z2/master/set")) {
-                int val = parseClampedInt(payload, 0, 20, 15);
-                sendDspFrame(0xA1, val, 2);
-                publishRaw(baseTopic + "/dsp/z2/master/state", String.valueOf(val), true);
-                return;
-            }
-            if (topic.equals(baseTopic + "/dsp/z2/left/set")) {
-                int val = parseClampedInt(payload, 0, 20, 12);
-                sendDspFrame(0xAE, val, 2);
-                publishRaw(baseTopic + "/dsp/z2/left/state", String.valueOf(val), true);
-                return;
-            }
-            if (topic.equals(baseTopic + "/dsp/z2/right/set")) {
-                int val = parseClampedInt(payload, 0, 20, 12);
-                sendDspFrame(0xAF, val, 2);
-                publishRaw(baseTopic + "/dsp/z2/right/state", String.valueOf(val), true);
-                return;
-            }
-
-            // DSP EQ
-            if (topic.equals(baseTopic + "/dsp/eq/bass/set")) {
-                int db = parseClampedInt(payload, -10, 10, 0);
-                int hex = 0xA0 + db;
-                sendDspFrame(0xAB, hex, 1);
-                sendDspFrame(0xAB, hex, 2);
-                publishRaw(baseTopic + "/dsp/eq/bass/state", String.valueOf(db), true);
-                return;
-            }
-            if (topic.equals(baseTopic + "/dsp/eq/treble/set")) {
-                int db = parseClampedInt(payload, -10, 10, 0);
-                int hex = 0xA0 + db;
-                sendDspFrame(0xAC, hex, 1);
-                sendDspFrame(0xAC, hex, 2);
-                publishRaw(baseTopic + "/dsp/eq/treble/state", String.valueOf(db), true);
-                return;
-            }
-            if (topic.equals(baseTopic + "/dsp/eq/mode/set")) {
-                int modeVal;
-                String modeName;
-                switch (payload.trim().toLowerCase(Locale.ROOT)) {
-                    case "pop": modeVal = 2; modeName = "Pop"; break;
-                    case "rock": modeVal = 3; modeName = "Rock"; break;
-                    case "classic": modeVal = 4; modeName = "Classic"; break;
-                    case "jazz": modeVal = 5; modeName = "Jazz"; break;
-                    case "vocal": modeVal = 6; modeName = "Vocal"; break;
-                    default: modeVal = 1; modeName = "Standard"; break;
-                }
-                sendDspFrame(0xA2, modeVal, 1);
-                sendDspFrame(0xA2, modeVal, 2);
-                publishRaw(baseTopic + "/dsp/eq/mode/state", modeName, true);
-                return;
-            }
-
-            if (topic.equals(baseTopic + "/display/power")) {
-                setHardwarePower("on".equalsIgnoreCase(payload));
-                if (isScreenHardwarePowered) redrawCurrentScreen();
-                return;
-            }
-            if (topic.equals(baseTopic + "/led/set")) {
-                setLedRingHardware("on".equalsIgnoreCase(payload));
-                return;
-            }
-
-            if (topic.equals(baseTopic + "/display/alert/clear")) {
-                hasUnreadAlert = false;
-                alertBadgeText = "";
-                isAlertKeepingAwake = false;
-                returnToClock();
-                if (!isMainScreenOn) setHardwarePower(false);
-                return;
-            }
-
-            if (topic.equals(baseTopic + "/display/gauge")) {
-                JSONObject j = new JSONObject(payload);
-                gaugeTitle = j.optString("title", "");
-                gaugeFooter = j.optString("footer", "");
-                gaugeValue = j.optInt("value", 50);
-                gaugeMin = j.optInt("min", 0);
-                gaugeMax = j.optInt("max", 100);
-                gaugeStep = j.optInt("step", 5);
-                gaugeUnit = j.optString("unit", "%");
-                gaugeColor = Color.parseColor(j.optString("color", "#00E5FF"));
-
-                currentMode = ScreenMode.GAUGE;
-                ensureScreenAwake();
-                animateGaugeToValue(gaugeValue);
-                resetTimeout(j.optInt("timeout", 5000));
-                return;
-            }
-
-            if (topic.equals(baseTopic + "/display/menu")) {
-                JSONObject j = new JSONObject(payload);
-                menuTitle = j.optString("title", "");
-                menuFooter = j.optString("footer", "");
-                menuItems.clear();
-                JSONArray arr = j.optJSONArray("items");
-                if (arr != null) {
-                    for (int i = 0; i < arr.length(); i++) menuItems.add(arr.getString(i));
-                }
-                menuIndex = Math.max(0, Math.min(menuItems.size() - 1, j.optInt("selected_index", 0)));
-
-                currentMode = ScreenMode.MENU;
-                ensureScreenAwake();
-                postRenderTask(this::drawMenuScreenInternal);
-                resetTimeout(j.optInt("timeout", 5000));
-                return;
-            }
-
-            if (topic.equals(baseTopic + "/display/media")) {
-                JSONObject j = new JSONObject(payload);
-                mediaHeader = j.optString("header", "");
-                mediaTitle = j.optString("title", "");
-                mediaSub = j.optString("sub", j.optString("artist", ""));
-                mediaProgress = j.optInt("progress", -1);
-
-                String b64 = j.optString("image_base64", "");
-                if (!b64.isEmpty()) {
-                    try {
-                        byte[] raw = Base64.decode(b64, Base64.DEFAULT);
-                        BitmapFactory.Options opts = new BitmapFactory.Options();
-                        opts.inPreferredConfig = Bitmap.Config.RGB_565;
-                        Bitmap decoded = BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
-                        if (decoded != null) {
-                            if (cachedMediaArt != null) cachedMediaArt.recycle();
-                            cachedMediaArt = decoded;
-                        }
-                    } catch (Exception ignored) {}
-                }
-
-                currentMode = ScreenMode.MEDIA;
-                ensureScreenAwake();
-                postRenderTask(this::drawMediaScreenInternal);
-                resetTimeout(j.optInt("timeout", 10000));
-                return;
-            }
-
-            if (topic.equals(baseTopic + "/display/alert")) {
-                JSONObject j = new JSONObject(payload);
-                alertTitle = j.optString("title", "");
-                alertMsg = j.optString("text", "");
-                alertFooter = j.optString("footer", "");
-                alertColor = j.optString("color", "#FF3D00");
-                boolean keepAwake = j.optBoolean("keep_awake", false);
-                boolean setBadge = j.optBoolean("badge", false);
-
-                if (setBadge) {
-                    hasUnreadAlert = true;
-                    alertBadgeText = alertTitle.isEmpty() ? "ALERT" : alertTitle;
-                }
-                isAlertKeepingAwake = keepAwake;
-
-                currentMode = ScreenMode.ALERT;
-                setHardwarePower(true);
-                postRenderTask(this::drawAlertScreenInternal);
-
-                if (!keepAwake) resetTimeout(j.optInt("duration", 4000));
-                else handler.removeCallbacks(timeoutCancelTask);
-                return;
-            }
-
-            if (topic.equals(baseTopic + "/display/clock")) {
-                returnToClock();
-            }
-
-        } catch (Exception ignored) {}
-    }
-
     private void ensureScreenAwake() {
         if (!isScreenHardwarePowered) setHardwarePower(true);
     }
@@ -1028,7 +1043,7 @@ public class BridgeService extends Service {
         });
     }
 
-    // --- PROCEDURY RYSOWANIA (Wątek sprzętowy) ---
+    // --- RENDEROWANIE (Zero wyścigów i brak alokacji) ---
     private void drawClockInternal() {
         renderCanvas.drawColor(Color.BLACK);
         paint.reset();
@@ -1226,7 +1241,6 @@ public class BridgeService extends Service {
         renderToFramebufferInternal();
     }
 
-    // Bezpośredni zapis do bufora /dev/graphics/fb1 (konwersja RGB565 i lustro X)
     private void renderToFramebufferInternal() {
         if (!isScreenHardwarePowered) return;
         try {
@@ -1282,6 +1296,7 @@ public class BridgeService extends Service {
             try { audioManager.unregisterAudioRecordingCallback(audioRecordingCallback); } catch (Exception ignored) {}
         }
 
+        mqttExecutor.shutdownNow();
         if (client != null) {
             try {
                 if (client.isConnected()) client.disconnectForcibly(500);
