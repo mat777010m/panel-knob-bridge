@@ -27,6 +27,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.provider.Settings;
 import android.util.Base64;
 import android.util.Log;
 import android.view.animation.DecelerateInterpolator;
@@ -44,7 +45,6 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -69,17 +69,17 @@ public class BridgeService extends Service {
     private volatile boolean running = true;
     private volatile boolean isConnecting = false;
 
-    // Kolejka operacji sprzętowych (jeden wątek: zero wyścigów)
+    // Kolejka operacji sprzętowych (jeden wątek roboczy: ochrona przed race conditions)
     private final ExecutorService hwExecutor = Executors.newSingleThreadExecutor();
     private Process inputMonitoringProc;
 
-    // Blokady zasilania
+    // Blokady zasilania i audio
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private AudioManager audioManager;
     private AudioManager.AudioRecordingCallback audioRecordingCallback;
 
-    // Deskryptory I/O
+    // Deskryptory I/O sprzętu
     private FileOutputStream ttyOutStream;
     private RandomAccessFile fbAccessFile;
 
@@ -98,7 +98,7 @@ public class BridgeService extends Service {
     private String alertFooter = "";
     private String alertColor = "#FF3D00";
 
-    // Tryby pracy wyświetlacza
+    // Tryby pracy
     private enum ScreenMode { CLOCK, GAUGE, MENU, MEDIA, ALERT }
     private ScreenMode currentMode = ScreenMode.CLOCK;
 
@@ -128,7 +128,7 @@ public class BridgeService extends Service {
     private int mediaProgress = -1;
     private Bitmap cachedMediaArt = null;
 
-    // ZERO-ALLOCATION RENDER BUFFERS (240x240 RGB565)
+    // ZERO-ALLOCATION BUFFERY (240x240 RGB565)
     private final Bitmap renderBmp = Bitmap.createBitmap(240, 240, Bitmap.Config.RGB_565);
     private final Canvas renderCanvas = new Canvas(renderBmp);
     private final int[] pixelArray = new int[240 * 240];
@@ -139,7 +139,7 @@ public class BridgeService extends Service {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint tickPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-    // Wstępnie obliczone współrzędne 19 kresek tarczy zegarowej (zero trygonometrii w klatkach)
+    // Tablica stałych współrzędnych 19 kresek tarczy wskaźnika
     private static final float[] TICK_COORDS = new float[19 * 4];
     static {
         int idx = 0;
@@ -261,34 +261,33 @@ public class BridgeService extends Service {
         this.baseTopic = prefs.getString("topic", this.baseTopic);
     }
 
-    // --- SPRZĘT: UART / SYSFS / FRAMEBUFFER ---
+    // --- STEROWANIE SPRZĘTEM ---
     private void initHardware() {
         hwExecutor.execute(() -> {
-            // Nadanie praw rootem jednorazowo przy starcie
             runRootCmdSync("stty -F /dev/ttyAS4 9600 cs8 -cstopb -parenb -echo raw && " +
                     "chmod 666 /dev/ttyAS4 /dev/graphics/fb1 /dev/input/event0 /proc/vendor/lcd_ctrl /proc/vendor/led_ctrl /sys/class/graphics/fb1/blank");
 
             try {
                 ttyOutStream = new FileOutputStream(new File("/dev/ttyAS4"));
             } catch (Exception e) {
-                Log.w(TAG, "Bezpośrednie otwarcie TTY nie powiodło się, używam fallbacku");
+                Log.w(TAG, "Bezpośrednie otwarcie TTY nie powiodło się");
             }
 
             try {
                 fbAccessFile = new RandomAccessFile("/dev/graphics/fb1", "rw");
             } catch (Exception e) {
-                Log.w(TAG, "Bezpośrednie otwarcie FB1 nie powiodło się, używam fallbacku");
+                Log.w(TAG, "Bezpośrednie otwarcie FB1 nie powiodło się");
             }
 
-            // Inicjalizacja wzmacniacza DSP (Master 15/20 odblokowuje strefy)
+            // Inicjalizacja domyślnego poziomu DSP
             sendDspFrameSync(0xA1, 15, 1);
             sendDspFrameSync(0xAE, 12, 1);
             sendDspFrameSync(0xAF, 12, 1);
             sendDspFrameSync(0xA1, 15, 2);
             sendDspFrameSync(0xAE, 12, 2);
             sendDspFrameSync(0xAF, 12, 2);
-            sendDspFrameSync(0xAB, 0xA0, 1); // EQ Bass Flat
-            sendDspFrameSync(0xAC, 0xA0, 1); // EQ Treble Flat
+            sendDspFrameSync(0xAB, 0xA0, 1);
+            sendDspFrameSync(0xAC, 0xA0, 1);
 
             setHardwarePowerInternal(true);
             drawClockInternal();
@@ -317,7 +316,6 @@ public class BridgeService extends Service {
             }
         }
 
-        // Fallback root command
         String hexCmd = String.format(Locale.US, "printf '\\xFA\\x01\\x%02X\\x%02X\\x%02X\\x%02X' > /dev/ttyAS4",
                 bCmd, bVal, bRoom, cs);
         runRootCmdSync(hexCmd);
@@ -398,7 +396,7 @@ public class BridgeService extends Service {
         }
     }
 
-    // --- ODCZYT ENKODERA ---
+    // --- ENKODER ---
     private void startRootInputMonitoring() {
         new Thread(() -> {
             while (running) {
@@ -536,13 +534,17 @@ public class BridgeService extends Service {
                     client = null;
                 }
 
-                client = new MqttClient(brokerUri, "PanelKnobEngine_" + Build.SERIAL, new MemoryPersistence());
+                String androidId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+                if (androidId == null || androidId.isEmpty()) androidId = "panel_knob_01";
+                String clientId = "PanelKnobEngine_" + androidId;
+
+                client = new MqttClient(brokerUri, clientId, new MemoryPersistence());
                 MqttConnectOptions opts = new MqttConnectOptions();
                 opts.setCleanSession(true);
                 opts.setAutomaticReconnect(true);
-                opts.setKeepAliveInterval(15);
-                opts.setConnectionTimeout(10);
-                opts.setMaxInflight(50);
+                opts.setKeepAliveInterval(60);
+                opts.setConnectionTimeout(30);
+                opts.setMaxInflight(100);
                 if (!mqttUser.isEmpty()) {
                     opts.setUserName(mqttUser);
                     opts.setPassword(mqttPass.toCharArray());
@@ -611,7 +613,9 @@ public class BridgeService extends Service {
                 msg.setRetained(retained);
                 client.publish(topic, msg);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd wysyłki na topic " + topic + ": " + e.getMessage());
+        }
     }
 
     private void publishHomeAssistantDiscovery() {
@@ -622,96 +626,121 @@ public class BridgeService extends Service {
             device.put("model", "Allwinner DSP Knob 240x240");
             device.put("manufacturer", "Smart Home Lab");
 
-            JSONObject ev = new JSONObject();
-            ev.put("name", "Zdarzenie Gałki");
-            ev.put("unique_id", "knob_event_trigger_v4");
-            ev.put("state_topic", baseTopic + "/knob/event");
-            ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
-            ev.put("device", device);
-            publishRaw("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
+            // Event Gałki
+            try {
+                JSONObject ev = new JSONObject();
+                ev.put("name", "Zdarzenie Gałki");
+                ev.put("unique_id", "knob_event_trigger_v4");
+                ev.put("state_topic", baseTopic + "/knob/event");
+                ev.put("event_types", new JSONArray().put("rotate_left").put("rotate_right").put("click"));
+                ev.put("device", device);
+                publishRaw("homeassistant/event/panel_knob/action_event/config", ev.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err EV: " + e.getMessage()); }
 
-            JSONObject act = new JSONObject();
-            act.put("name", "Akcja Gałki");
-            act.put("unique_id", "knob_action_sensor_v4");
-            act.put("state_topic", baseTopic + "/knob/action");
-            act.put("force_update", true);
-            act.put("icon", "mdi:rotate-right");
-            act.put("device", device);
-            publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
+            // Sensor Akcji
+            try {
+                JSONObject act = new JSONObject();
+                act.put("name", "Akcja Gałki");
+                act.put("unique_id", "knob_action_sensor_v4");
+                act.put("state_topic", baseTopic + "/knob/action");
+                act.put("force_update", true);
+                act.put("icon", "mdi:rotate-right");
+                act.put("device", device);
+                publishRaw("homeassistant/sensor/panel_knob/action/config", act.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err ACT: " + e.getMessage()); }
 
-            JSONObject conf = new JSONObject();
-            conf.put("name", "Zatwierdzona Wartość");
-            conf.put("unique_id", "knob_confirm_val_v4");
-            conf.put("state_topic", baseTopic + "/knob/confirm");
-            conf.put("icon", "mdi:check-circle-outline");
-            conf.put("device", device);
-            publishRaw("homeassistant/sensor/panel_knob/confirm/config", conf.toString(), true);
+            // Sensor Potwierdzenia
+            try {
+                JSONObject conf = new JSONObject();
+                conf.put("name", "Zatwierdzona Wartość");
+                conf.put("unique_id", "knob_confirm_val_v4");
+                conf.put("state_topic", baseTopic + "/knob/confirm");
+                conf.put("icon", "mdi:check-circle-outline");
+                conf.put("device", device);
+                publishRaw("homeassistant/sensor/panel_knob/confirm/config", conf.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err CONF: " + e.getMessage()); }
 
-            JSONObject pwr = new JSONObject();
-            pwr.put("name", "Zasilanie Ekraniku");
-            pwr.put("unique_id", "knob_power_switch_v4");
-            pwr.put("command_topic", baseTopic + "/display/power");
-            pwr.put("state_topic", baseTopic + "/display/state");
-            pwr.put("payload_on", "on");
-            pwr.put("payload_off", "off");
-            pwr.put("icon", "mdi:power");
-            pwr.put("device", device);
-            publishRaw("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
+            // Switch Zasilania Ekraniku
+            try {
+                JSONObject pwr = new JSONObject();
+                pwr.put("name", "Zasilanie Ekraniku");
+                pwr.put("unique_id", "knob_power_switch_v4");
+                pwr.put("command_topic", baseTopic + "/display/power");
+                pwr.put("state_topic", baseTopic + "/display/state");
+                pwr.put("payload_on", "on");
+                pwr.put("payload_off", "off");
+                pwr.put("icon", "mdi:power");
+                pwr.put("device", device);
+                publishRaw("homeassistant/switch/panel_knob/power/config", pwr.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err PWR: " + e.getMessage()); }
 
-            JSONObject led = new JSONObject();
-            led.put("name", "Pierścień LED");
-            led.put("unique_id", "knob_led_ring_v4");
-            led.put("command_topic", baseTopic + "/led/set");
-            led.put("state_topic", baseTopic + "/led/state");
-            led.put("payload_on", "on");
-            led.put("payload_off", "off");
-            led.put("icon", "mdi:led-strip-variant");
-            led.put("device", device);
-            publishRaw("homeassistant/switch/panel_knob/led_ring/config", led.toString(), true);
+            // Switch Pierścienia LED
+            try {
+                JSONObject led = new JSONObject();
+                led.put("name", "Pierścień LED");
+                led.put("unique_id", "knob_led_ring_v4");
+                led.put("command_topic", baseTopic + "/led/set");
+                led.put("state_topic", baseTopic + "/led/state");
+                led.put("payload_on", "on");
+                led.put("payload_off", "off");
+                led.put("icon", "mdi:led-strip-variant");
+                led.put("device", device);
+                publishRaw("homeassistant/switch/panel_knob/led_ring/config", led.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err LED: " + e.getMessage()); }
 
-            JSONObject micM = new JSONObject();
-            micM.put("name", "Wyciszenie Mikrofonu");
-            micM.put("unique_id", "knob_mic_mute_v4");
-            micM.put("command_topic", baseTopic + "/mic/mute/set");
-            micM.put("state_topic", baseTopic + "/mic/mute/state");
-            micM.put("payload_on", "ON");
-            micM.put("payload_off", "OFF");
-            micM.put("icon", "mdi:microphone-off");
-            micM.put("device", device);
-            publishRaw("homeassistant/switch/panel_knob/mic_mute/config", micM.toString(), true);
+            // Switch Wyciszenia Mikrofonu
+            try {
+                JSONObject micM = new JSONObject();
+                micM.put("name", "Wyciszenie Mikrofonu");
+                micM.put("unique_id", "knob_mic_mute_v4");
+                micM.put("command_topic", baseTopic + "/mic/mute/set");
+                micM.put("state_topic", baseTopic + "/mic/mute/state");
+                micM.put("payload_on", "ON");
+                micM.put("payload_off", "OFF");
+                micM.put("icon", "mdi:microphone-off");
+                micM.put("device", device);
+                publishRaw("homeassistant/switch/panel_knob/mic_mute/config", micM.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err MICM: " + e.getMessage()); }
 
-            JSONObject micA = new JSONObject();
-            micA.put("name", "Mikrofon Używany");
-            micA.put("unique_id", "knob_mic_active_v4");
-            micA.put("state_topic", baseTopic + "/mic/active/state");
-            micA.put("payload_on", "ON");
-            micA.put("payload_off", "OFF");
-            micA.put("icon", "mdi:microphone");
-            micA.put("device", device);
-            publishRaw("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
+            // Binary Sensor Mikrofon Używany
+            try {
+                JSONObject micA = new JSONObject();
+                micA.put("name", "Mikrofon Używany");
+                micA.put("unique_id", "knob_mic_active_v4");
+                micA.put("state_topic", baseTopic + "/mic/active/state");
+                micA.put("payload_on", "ON");
+                micA.put("payload_off", "OFF");
+                micA.put("icon", "mdi:microphone");
+                micA.put("device", device);
+                publishRaw("homeassistant/binary_sensor/panel_knob/mic_active/config", micA.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err MICA: " + e.getMessage()); }
 
+            // DSP Strefa 1 i 2
             registerNumberEntity("dsp_z1_master", "Strefa 1 Głośność Główna", baseTopic + "/dsp/z1/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z1_left", "Strefa 1 Głośnik Lewy", baseTopic + "/dsp/z1/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z1_right", "Strefa 1 Głośnik Prawy", baseTopic + "/dsp/z1/right", 0, 20, "mdi:speaker", device);
-
             registerNumberEntity("dsp_z2_master", "Strefa 2 Głośność Główna", baseTopic + "/dsp/z2/master", 0, 20, "mdi:volume-high", device);
             registerNumberEntity("dsp_z2_left", "Strefa 2 Głośnik Lewy", baseTopic + "/dsp/z2/left", 0, 20, "mdi:speaker", device);
             registerNumberEntity("dsp_z2_right", "Strefa 2 Głośnik Prawy", baseTopic + "/dsp/z2/right", 0, 20, "mdi:speaker", device);
 
+            // DSP Korektor EQ
             registerNumberEntity("dsp_eq_bass", "Korektor Basy", baseTopic + "/dsp/eq/bass", -10, 10, "mdi:equalizer", device);
             registerNumberEntity("dsp_eq_treble", "Korektor Soprany", baseTopic + "/dsp/eq/treble", -10, 10, "mdi:equalizer", device);
 
-            JSONObject eqProf = new JSONObject();
-            eqProf.put("name", "Profil Dźwięku EQ");
-            eqProf.put("unique_id", "knob_dsp_eq_mode_v4");
-            eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
-            eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
-            eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
-            eqProf.put("icon", "mdi:music-box-outline");
-            eqProf.put("device", device);
-            publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
+            // Wybór Profilu EQ
+            try {
+                JSONObject eqProf = new JSONObject();
+                eqProf.put("name", "Profil Dźwięku EQ");
+                eqProf.put("unique_id", "knob_dsp_eq_mode_v4");
+                eqProf.put("command_topic", baseTopic + "/dsp/eq/mode/set");
+                eqProf.put("state_topic", baseTopic + "/dsp/eq/mode/state");
+                eqProf.put("options", new JSONArray().put("Standard").put("Pop").put("Rock").put("Classic").put("Jazz").put("Vocal"));
+                eqProf.put("icon", "mdi:music-box-outline");
+                eqProf.put("device", device);
+                publishRaw("homeassistant/select/panel_knob/dsp_eq_mode/config", eqProf.toString(), true);
+            } catch (Exception e) { Log.e(TAG, "Err EQPROF: " + e.getMessage()); }
 
-            // Publikacja stanów początkowych
+            // Publikacja stanów domyślnych
             publishRaw(baseTopic + "/dsp/z1/master/state", "15", true);
             publishRaw(baseTopic + "/dsp/z1/left/state", "12", true);
             publishRaw(baseTopic + "/dsp/z1/right/state", "12", true);
@@ -721,7 +750,11 @@ public class BridgeService extends Service {
             publishRaw(baseTopic + "/dsp/eq/bass/state", "0", true);
             publishRaw(baseTopic + "/dsp/eq/treble/state", "0", true);
             publishRaw(baseTopic + "/dsp/eq/mode/state", "Standard", true);
-        } catch (Exception ignored) {}
+
+            Log.i(TAG, "Discovery HA zakończone pomyślnie.");
+        } catch (Exception e) {
+            Log.e(TAG, "Główny błąd discovery: " + e.getMessage());
+        }
     }
 
     private void registerNumberEntity(String id, String name, String topicPrefix, int min, int max, String icon, JSONObject device) {
@@ -737,7 +770,9 @@ public class BridgeService extends Service {
             obj.put("icon", icon);
             obj.put("device", device);
             publishRaw("homeassistant/number/panel_knob/" + id + "/config", obj.toString(), true);
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd rejestracji suwaka " + id + ": " + e.getMessage());
+        }
     }
 
     private int parseClampedInt(String payload, int min, int max, int defaultVal) {
@@ -993,7 +1028,7 @@ public class BridgeService extends Service {
         });
     }
 
-    // --- RYSOWANIE GRAFIKI (Wątek sprzętowy: Zero wyścigów i Zero alokacji) ---
+    // --- PROCEDURY RYSOWANIA (Wątek sprzętowy) ---
     private void drawClockInternal() {
         renderCanvas.drawColor(Color.BLACK);
         paint.reset();
@@ -1096,7 +1131,6 @@ public class BridgeService extends Service {
             paint.setColor(Color.WHITE);
             paint.setTypeface(Typeface.DEFAULT_BOLD);
 
-            // Dynamiczne dopasowanie fontu, aby tekst nie wychodził poza okrągły ekran
             float fontSize = 32f;
             paint.setTextSize(fontSize);
             while (fontSize > 16f && paint.measureText(currentItem) > 160f) {
@@ -1192,7 +1226,7 @@ public class BridgeService extends Service {
         renderToFramebufferInternal();
     }
 
-    // Konwersja bitmapy do formatu RGB565 i zapis do framebuffer /dev/graphics/fb1
+    // Bezpośredni zapis do bufora /dev/graphics/fb1 (konwersja RGB565 i lustro X)
     private void renderToFramebufferInternal() {
         if (!isScreenHardwarePowered) return;
         try {
@@ -1201,7 +1235,6 @@ public class BridgeService extends Service {
             int idx = 0;
             for (int y = 0; y < 240; y++) {
                 int rowOffset = y * 240;
-                // Odwrócenie osi X (ekran gałki ma odwrócone mapowanie poziome)
                 for (int x = 239; x >= 0; x--) {
                     int p = pixelArray[rowOffset + x];
                     int r = (p >> 19) & 0x1F;
@@ -1225,7 +1258,6 @@ public class BridgeService extends Service {
                 }
             }
 
-            // Fallback przez ponowne otwarcie strumienia
             try (FileOutputStream fos = new FileOutputStream("/dev/graphics/fb1")) {
                 fos.write(rawFbBuffer);
                 fos.flush();
